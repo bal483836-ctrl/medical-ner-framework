@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 推理输出（体积大，不入库）
+outputs/
+logs/
+
+# 模型权重（本地路径，不入库）
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# 数据集原始文件（按需保留）
+# data/CMeEE_V2/
+# data/IMCS_V2/
+# data/yidu_4k/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.local
