@@ -1,101 +1,57 @@
-# 医疗命名实体识别框架 v3
+# 医疗 NER + 断言训练框架 v4.1
 
-基于 **大小模型混合架构** 的医疗NER框架，完全本地化运行（无需任何外部 API）。
+零样本医疗命名实体识别 + 4 类断言分类的科研级流水线。
 
-- **大模型**：本地 Qwen3-14B（直接加载，BF16 全精度）
-- **小模型**：本地 bge-large-zh-v1.5（1024维向量，余弦相似度匹配）
-- **归一化词典**：IMCS 官方 symptom_norm.csv（331个标准词）
+- **NER 目标**：Micro F1 ≥ 0.80（CMeEE_V2、IMCS_V2）
+- **断言目标**：Macro F1 ≥ 0.90（4 类：确定 / 疑似 / 无 / 知识事实）
+- **严格防数据泄露**：test split 全程不参与训练；分类器按文档分组划分内部 val。
 
----
+## v4.1 升级要点（吸取 v21 + 旧版断言代码精华）
 
-## 支持的数据集
-
-| 数据集 | Split | 功能 | 目标 Micro F1 |
-|--------|-------|------|--------------|
-| CMeEE_V2 | train / dev / test | 实体提取 + F1评估（test无标注只提取） | **≥ 0.80** |
-| IMCS_V2 | train / dev / test | 实体提取 + 双F1评估（test无标注只提取） | 归一化 **≥ 0.80** |
-| yidu_4k | train | 只提取，不评估 F1 | — |
-
----
-
-## 整体流程
-
-```
-原始文本
-    │
-    ▼
-[Step 1] 大模型少样本抽取（Qwen3-14B）
-    │     少样本示例只从 train 集提取一次，全局复用
-    │     CMeEE：8条示例，强调单字词+嵌套实体
-    │     IMCS：8条示例，强调口语化原样提取
-    │     yidu：复用 CMeEE 示例（同为医学文本）
-    │
-    ▼（仅 CMeEE）
-[Step 1.5] 嵌套实体扩展
-    │     CMeEE 多粒度嵌套特性：长词（≥5字）全文扫描，短词独立词检查
-    │
-    ▼
-[Step 2] 小模型余弦相似度图谱对齐（bge-large-zh-v1.5）
-    │     CMeEE：原文锚定防止跨样本FP
-    │     IMCS：建立原词→标准词映射表（保留原词供Step3锚定）
-    │
-    ▼
-[Step 3] 幻觉过滤
-    │     CMeEE：纯规则过滤（黑名单+单字词白名单）
-    │     IMCS：原文锚定检查（用原词，非标准词）+ 大模型审核
-    │
-    ▼
-[Step 4] 归一化 + 双 F1 评估
-          CMeEE：字面 Micro F1
-          IMCS：字面 F1 + 归一化 F1（通过 step2_normalized_map 映射）
-          yidu：只输出结果，不评估
-```
+| 模块 | 升级 |
+|---|---|
+| 预学习 | LLM 自动归纳 skills（看 30 条样本生成"看到 X 做 Y"规则）+ 文件缓存 |
+| KG | 直接加载 `data/entities_dict.txt` + `data/triples.txt`（60K 节点 / 354K 三元组） |
+| 反思 | DeepSeek CoT 格式 `<thinking>...</thinking><answer>...</answer>` |
+| 动态窗口 | BGE 语义 × 10 + spaCy 句法依存 × 5 + 否定关键词 × 3 - 距离惩罚 |
+| 断言标注 | Entity Marker `[E]...[/E]` 消歧 + JSON 输出 + KG 知识参考 |
+| 分类器 | **FocalLoss(γ=1.6) + FGM 对抗(ε=0.11) + 类权重 + 实体标记【】** |
+| yidu | 自动识别新版 JSON / 旧版 BIO |
 
 ---
 
-## 关键设计说明
+## 数据集
 
-### 1. 少样本示例全局复用（不重复构建）
+| 数据集 | 用途 | Split | F1 评估 |
+|--------|------|-------|---------|
+| CMeEE_V2 | 实体抽取 | train / dev / test | dev 评估 |
+| IMCS_V2  | 对话抽取 + 归一化 | train / dev / test | dev 评估 |
+| yidu_4k  | 病历抽取 | train | 只抽取 |
 
-```python
-# run_pipeline.py 中，只调用一次
-cmeee_few_shot_str, imcs_few_shot_str = build_global_few_shot()
-# 之后所有 split（train/dev/test）都复用这两个字符串
-```
+IMCS 是医患对话；流水线在 Step1 抽取时按角色（speaker）逐轮展开，并保留对话上下文窗口。
 
-CMeEE 示例选取策略：优先选含单字词、嵌套实体、多种实体类型的样本。
-IMCS 示例选取策略：优先选含口语化表述（"拉肚子"、"发烫"等）的样本。
+---
 
-### 2. CMeEE 嵌套实体扩展（Step 1.5）
-
-CMeEE 的 Gold 标注是多粒度嵌套的（"胃酸"和"胃酸分泌增加"都是 Gold 实体）。
-大模型倾向于只抽取最长词，导致短词漏报（召回率低）。
-
-扩展策略：
-- **长词（≥5字）**：在原文中精确扫描，出现即加入候选集（精确度高）
-- **短词（<5字）**：独立词检查（前后不是汉字/字母才算独立词，防止切割长词）
-- **合并词过滤**：过滤含顿号/连字符的合并词（如"体、肺循环"）
-
-### 3. IMCS 归一化流程（v3 核心修复）
-
-**v3 修复了一个严重 Bug**：旧版 Step2 将口语化词直接替换为标准词，导致 Step3 的原文锚定检查失败（原文中只有"拉肚子"，没有"腹泻"，所以"腹泻"被误删）。
-
-修复后的正确数据流：
+## 9 阶段流程
 
 ```
-Step1 输出：["拉肚子", "发烫", "咳嗽"]
-    ↓
-Step2 输出：
-  step2_aligned_output = "拉肚子,发烫,咳嗽"   ← 保留原词（供Step3锚定）
-  step2_normalized_map = {"拉肚子":"腹泻", "发烫":"发热", "咳嗽":"咳嗽"}
-  step2_norm_output    = "腹泻,发热,咳嗽"      ← 标准词（供Step4直接读取）
-    ↓
-Step3 输出：
-  step3_final_output = "拉肚子,发烫,咳嗽"     ← 仍然是原词（锚定检查通过）
-    ↓
-Step4 归一化：
-  通过 step2_normalized_map 映射 → ["腹泻", "发热", "咳嗽"]
-  与 Gold ["腹泻", "发热", "咳嗽"] 比较 → 归一化 F1
+1. 数据处理              src/data_processor.py
+2. 预学习 (100 条/集)    src/preanalysis.py
+   → 长度/前后缀/嵌套统计 → skills + 参考示例
+3. 实体抽取
+   Step1   Qwen3-32B 少样本抽取  src/extract_entities.py
+   Step1.5 CMeEE 嵌套扩展        src/cmeee_expand.py
+   Step1.7 DeepSeek 反思校验     src/reflector.py
+   Step2   IMCS 归一化对齐       src/kg_alignment.py
+   Step2.5 KG 余弦过滤 ≥0.80     src/kg.py
+   Step3   规则/LLM 幻觉过滤     src/filter_hallucinations.py
+4. NER 评估              src/normalize_and_evaluate.py
+5. KG 语义扩展           src/kg.py            (同义/上位/相关)
+6. 动态语境窗口截取      src/context_window.py
+7. LLM 断言标注          src/assertion_annotator.py
+8. 分布检测 + 增强       src/augmentor.py
+9. RoBERTa 分类器训练    src/assertion_train.py
+   + test 评估           src/assertion_eval.py
 ```
 
 ---
@@ -103,147 +59,163 @@ Step4 归一化：
 ## 目录结构
 
 ```
-medical_ner_v3/
-├── config/
-│   └── config.py              # 全局配置（路径、模型、阈值、参数）
+medical-ner-framework/
+├── config/config.py
 ├── src/
-│   ├── data_processor.py      # 数据加载、Gold提取、少样本构建、工具函数
-│   ├── llm_client.py          # Qwen3-14B 本地推理（单例懒加载）
-│   ├── embedding_model.py     # bge-large-zh-v1.5 向量模型
-│   ├── extract_entities.py    # Step1：大模型少样本实体抽取
-│   ├── cmeee_expand.py        # Step1.5：CMeEE嵌套实体扩展
-│   ├── kg_alignment.py        # Step2：余弦相似度图谱对齐（修复版）
-│   ├── filter_hallucinations.py  # Step3：幻觉过滤（修复版）
-│   └── normalize_and_evaluate.py # Step4：归一化与双F1评估（修复版）
-├── data/
-│   └── symptom_norm.csv       # IMCS官方归一化词典（331个标准词）
-├── outputs/                   # 各步骤输出（自动创建）
-│   ├── step1_raw_CMeEE_V2_dev.json
-│   ├── step1_enriched_CMeEE_V2_dev.json
-│   ├── step2_aligned_CMeEE_V2_dev.json
-│   ├── step3_final_CMeEE_V2_dev.json
-│   ├── step1_raw_IMCS_V2_dev.json
-│   ├── step2_aligned_IMCS_V2_dev.json
-│   ├── step3_final_IMCS_V2_dev.json
-│   ├── step1_raw_yidu_4k_train.json
-│   ├── evaluation_report.md   ← 汇总评估报告
-│   └── evaluation_report.json
-└── run_pipeline.py            # 主流程入口
+│   ├── data_processor.py         数据加载/清洗/Gold 提取
+│   ├── llm_client.py             Qwen3-32B + DeepSeek 双后端
+│   ├── embedding_model.py        bge-large-zh-v1.5
+│   ├── preanalysis.py            阶段 2：预学习 → skills
+│   ├── extract_entities.py       Step1 抽取（对话按轮次展开）
+│   ├── cmeee_expand.py           Step1.5 嵌套扩展
+│   ├── reflector.py              Step1.7 DeepSeek 反思
+│   ├── kg_alignment.py           Step2 IMCS 归一化
+│   ├── kg.py                     KG 加载 + 过滤 + 扩展
+│   ├── filter_hallucinations.py  Step3 幻觉过滤
+│   ├── normalize_and_evaluate.py Step4 NER 评估
+│   ├── context_window.py         阶段 5 动态窗口
+│   ├── assertion_annotator.py    阶段 6 LLM 断言
+│   ├── augmentor.py              阶段 7 分布+增强
+│   ├── assertion_train.py        阶段 8 RoBERTa 训练
+│   └── assertion_eval.py         阶段 9 macro F1 评估
+├── data/symptom_norm.csv         IMCS 官方词典
+├── outputs/                      所有中间结果
+├── run_pipeline.py               NER 主流程 (阶段 1-4)
+└── run_assertion_pipeline.py     断言主流程 (阶段 5-9)
 ```
 
 ---
 
-## 快速开始
-
-### 1. 环境准备
+## 环境与模型
 
 ```bash
-# 必需依赖
-pip install transformers accelerate tqdm scikit-learn
-
-# 推荐：Flash Attention 2（5090 显卡加速推理，速度提升 30%+）
+pip install transformers accelerate tqdm scikit-learn FlagEmbedding
+# 可选 GPU 优化
 pip install flash-attn --no-build-isolation
-
-# 推荐：FlagEmbedding（BGE 官方库，效果最好）
-pip install FlagEmbedding
-
-# 备选：sentence-transformers
-pip install sentence-transformers
 ```
 
-### 2. 放置归一化词典
+环境变量配置：
 
 ```bash
-# 将 symptom_norm.csv 复制到数据集目录（可选，框架 data/ 目录已自带）
-cp medical_ner_v3/data/symptom_norm.csv /root/autodl-tmp/MedNER_Project/data/
+export MNER_DATA_ROOT=/path/to/data                # 数据集根目录
+export MNER_MODEL_ROOT=/path/to/models             # 模型根目录
+export MNER_KG_PATH=/path/to/medical_kg.json       # 外部 KG（可选）
+export MNER_USE_FLASH_ATTN=true                    # 5090 推荐
+export MNER_USE_4BIT=false                         # 显存不足可改 true
 ```
 
-### 3. 运行命令
+模型放置：
+
+```
+models/
+├── Qwen3-32B/                    # 主抽取 + 断言
+├── DeepSeek-V2-Lite-Chat/        # 反思
+├── bge-large-zh-v1.5/            # 向量
+└── chinese-roberta-wwm-ext/      # 断言分类器
+```
+
+---
+
+## 运行
+
+### NER 阶段（1-4）
 
 ```bash
-cd /root/autodl-tmp/MedNER_Project/medical_ner_v3
-
-# ---- 推荐：先快速测试验证流程（每个split前20条，约30分钟）----
-export MNER_USE_FLASH_ATTN=true
-python run_pipeline.py --quick-test
-
-# ---- 只运行 dev split（最常用，快速验证F1）----
-python run_pipeline.py --dataset cmeee --split dev
-python run_pipeline.py --dataset imcs  --split dev
-
-# ---- 全量运行（CMeEE train+dev+test + IMCS train+dev+test + yidu）----
+# 全量
 python run_pipeline.py
 
-# ---- 只运行特定数据集 ----
-python run_pipeline.py --dataset cmeee   # 只运行 CMeEE
-python run_pipeline.py --dataset imcs    # 只运行 IMCS
-python run_pipeline.py --dataset yidu    # 只运行 yidu
+# 只跑预学习，看 skills 是否合理
+python run_pipeline.py --preanalysis-only
 
-# ---- 跳过 Step3 大模型过滤（节省约30%时间，F1略降）----
+# 只 CMeEE dev
+python run_pipeline.py --dataset cmeee --split dev
+
+# 关掉反思 / KG 过滤 / Step3（消融用）
+python run_pipeline.py --no-reflect
+python run_pipeline.py --no-kgfilter
 python run_pipeline.py --no-step3
 
-# ---- 只重新运行 Step4 评估（已有Step3输出时，秒级完成）----
-python run_pipeline.py --step 4
-
-# ---- 调整 CMeEE 嵌套扩展的长词阈值（默认5，越小召回越高但FP越多）----
-python run_pipeline.py --cmeee-long-min 4
+# 快速冒烟（每 split 20 条）
+python run_pipeline.py --quick-test
 ```
 
-### 4. 断点续跑
+产物（关键）：
+- `outputs/preanalysis_report.json` 预学习报告
+- `outputs/step3_final_{ds}_{split}.json` 过滤后实体
+- `outputs/evaluation_report.{md,json}` NER F1 报告
 
-程序每处理 50 条（CMeEE）或 20 条（IMCS）自动保存一次中间结果。
-若中途中断，重新运行同样命令即可自动从断点继续，无需重新处理已完成的数据。
-
----
-
-## 显存要求
-
-| 配置 | 显存需求 | 推荐场景 |
-|------|---------|---------|
-| BF16 全精度（默认） | ~28GB | RTX 5090（32GB）推荐，F1最高 |
-| 4-bit NF4 量化 | ~10GB | 显存不足时使用，F1降约0.03-0.05 |
+### 断言阶段（5-9）
 
 ```bash
-# 启用 4-bit 量化
-export MNER_USE_4BIT=true
-python run_pipeline.py
+# 必须先跑完 NER 的 step3，再执行
+python run_assertion_pipeline.py --dataset cmeee
+python run_assertion_pipeline.py --dataset imcs
+
+# 已有标注，只重训分类器
+python run_assertion_pipeline.py --dataset cmeee --skip-annotate
 ```
 
----
-
-## F1 调优指南
-
-### CMeEE F1 偏低（< 0.78）
-
-| 问题 | 解决方案 |
-|------|---------|
-| 召回率低（R < 0.75） | 降低长词阈值：`--cmeee-long-min 4` |
-| 精确率低（P < 0.80） | 提高长词阈值：`--cmeee-long-min 6` |
-| Step3 过滤太激进 | 检查 `step3_final_CMeEE_V2_dev.json`，查看被删除的词 |
-
-### IMCS 归一化 F1 偏低（< 0.75）
-
-| 问题 | 解决方案 |
-|------|---------|
-| 词典未加载 | 确认 `data/symptom_norm.csv` 存在（331个标准词） |
-| 锚定检查太严 | 降低阈值：修改 `filter_hallucinations.py` 中 `anchor_threshold=0.60` |
-| Step2 映射不准 | 检查 `step2_aligned_IMCS_V2_dev.json` 中的 `step2_normalized_map` |
-| 归一化覆盖率低 | 在 `normalize_and_evaluate.py` 中降低 `medium` 相似度阈值 |
-
-### 通用优化
-
-- 增加少样本数量：修改 `config.py` 中 `FEW_SHOT_COUNT = 12`
-- 调整相似度阈值：修改 `config.py` 中 `HIGH_SIM_THRESHOLD`（降低可提升召回）
-- 扩展强召回词库：在 `config.py` 的 `IMCS_FORCE_RECALL_WORDS` 中添加更多词
+产物：
+- `outputs/assertion_{ds}_{split}.json` LLM 标注结果（train/dev/test）
+- `outputs/assertion_{ds}_train_aug.json` 增强后训练集
+- `outputs/assertion_clf/` 训练好的 RoBERTa 模型
+- `outputs/assertion_eval_report.json` macro F1 报告
 
 ---
 
-## 预期运行时间（RTX 5090，Flash Attention 开启）
+## KG 文件格式
 
-| 数据集 | Split | 样本数 | 预计时间 |
-|--------|-------|--------|---------|
-| CMeEE | dev | 1500条 | ~2小时 |
-| CMeEE | train | 15000条 | ~20小时 |
-| IMCS | dev | 248条 | ~3小时 |
-| IMCS | train | ~1000条 | ~12小时 |
-| yidu | train | ~4000条 | ~5小时 |
+`MNER_KG_PATH` 指向 JSON，支持两种 schema：
+
+```jsonc
+// A) 平铺列表
+["腹泻", "发热", "咳嗽", ...]
+
+// B) 带语义信息（推荐）
+{
+  "腹泻": {
+    "synonyms":  ["拉肚子", "稀便"],
+    "hypernyms": ["消化系统症状"],
+    "related":   ["脱水", "腹痛"]
+  },
+  ...
+}
+```
+
+KG 缺失时自动降级使用训练集词表（已锚定语料分布，不会引入分布外信息）。
+
+---
+
+## 防数据泄露设计
+
+| 风险 | 对策 |
+|------|------|
+| test 数据进入训练 | 主流程严格按 split 隔离；分类器 train+dev 才喂入 |
+| 同文档实体跨集合 | `group_split` 按 `doc_id / dialogue_id` 分组划 val |
+| 预学习偷看 dev/test | `preanalysis.py` 强制只读 `train` |
+| Few-shot 偷看 dev/test | `build_global_few_shot` 强制只读 `train` |
+| KG 外部信息泄露 | KG 在断言前接入；过滤阈值固定 0.80 |
+| 增强样本污染 dev | 增强样本只附加到 `train`，dev 保持原始分布 |
+
+---
+
+## 调参建议
+
+| 现象 | 旋钮 |
+|------|------|
+| NER 召回低 | `--cmeee-long-min 4`；降低 `HIGH_SIM_THRESHOLD` |
+| NER 精度低 | 开启 `--no-step3` 关闭看效果；提高 `HIGH_SIM_THRESHOLD` |
+| IMCS 归一化差 | 检查 `symptom_norm.csv` 是否完整；调 `kg_alignment.py` 中阈值 |
+| 断言 macro F1 < 0.9 | 检查少数类是否触发增强；调大 `CLF_EPOCHS`；扩 `CONTEXT_WINDOW_CHARS` |
+| 显存 OOM | 设 `MNER_USE_4BIT=true`；调小 `extract_entities.py` 中 batch 常量 |
+
+---
+
+## 实施限制说明
+
+本仓库是代码框架。要复现 F1 指标，需准备：
+
+1. 三个数据集（CMeEE_V2 / IMCS_V2 / yidu_4k）
+2. 本地模型权重（Qwen3-32B、DeepSeek、bge、roberta）
+3. 单卡 ≥ 32GB 显存（BF16）或 ≥ 16GB（4bit）
+4. 可选：外部医学 KG JSON

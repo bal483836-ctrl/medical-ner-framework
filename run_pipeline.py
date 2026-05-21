@@ -1,17 +1,14 @@
 """
-医疗NER框架主流程 v3
-支持：CMeEE_V2 全量 + IMCS_V2 全量 + yidu_4k 提取
-少样本示例只从 train 集提取一次，全局复用
+医疗 NER 主流程 v4
+集成：预学习 skills + Step1 抽取 + Step1.5 嵌套扩展 + Step2 KG 对齐
+     + Step2.5 反思校验 + Step2.7 KG 相似度过滤(≥0.80) + Step3 幻觉过滤 + Step4 评估
 
-运行方式：
-  python run_pipeline.py                        # 全量运行
-  python run_pipeline.py --quick-test           # 快速测试（每个split前20条）
-  python run_pipeline.py --dataset cmeee        # 只运行 CMeEE
-  python run_pipeline.py --dataset imcs         # 只运行 IMCS
-  python run_pipeline.py --dataset yidu         # 只运行 yidu
-  python run_pipeline.py --split dev            # 只运行 dev split
-  python run_pipeline.py --step 1               # 只运行 Step1
-  python run_pipeline.py --no-step3             # 跳过 Step3（大模型过滤，节省时间）
+运行：
+  python run_pipeline.py                        # 全量
+  python run_pipeline.py --dataset cmeee --split dev
+  python run_pipeline.py --preanalysis-only     # 只跑预学习
+  python run_pipeline.py --no-reflect           # 跳过反思
+  python run_pipeline.py --no-kgfilter          # 跳过 KG 相似度过滤
 """
 import argparse
 import json
@@ -24,12 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.config import (
     OUTPUT_DIR, DATASET_SPLITS,
     STEP1_PREFIX, STEP1E_PREFIX, STEP2_PREFIX, STEP3_PREFIX,
+    HIGH_SIM_THRESHOLD,
 )
 from src.extract_entities import (
     build_global_few_shot,
-    extract_cmeee_split,
-    extract_imcs_split,
-    extract_yidu,
+    extract_cmeee_split, extract_imcs_split, extract_yidu,
 )
 from src.cmeee_expand import enrich_cmeee_step1
 from src.kg_alignment import align_cmeee_split, align_imcs_split
@@ -39,234 +35,253 @@ from src.normalize_and_evaluate import (
 )
 from src.data_processor import (
     load_cmeee, build_cmeee_entity_vocab, build_imcs_norm_vocab,
+    clean_entity_list,
 )
+from src.preanalysis import run_preanalysis, render_skills_block
+from src.reflector import reflect_cmeee, reflect_imcs, reflect_yidu
+from src.kg import load_kg
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="医疗NER框架 v3")
-    parser.add_argument("--quick-test", action="store_true",
-                        help="快速测试模式（每个split只处理前20条）")
-    parser.add_argument("--dataset", choices=["cmeee", "imcs", "yidu", "all"],
-                        default="all", help="指定运行的数据集")
-    parser.add_argument("--split", choices=["train", "dev", "test", "all"],
-                        default="all", help="指定运行的split")
-    parser.add_argument("--step", type=int, choices=[1, 2, 3, 4],
-                        default=None, help="只运行指定步骤（默认全部）")
-    parser.add_argument("--no-step3", action="store_true",
-                        help="跳过Step3大模型过滤（节省时间，用Step2结果直接评估）")
-    parser.add_argument("--cmeee-long-min", type=int, default=5,
-                        help="CMeEE嵌套扩展的长词阈值（默认5）")
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--quick-test", action="store_true")
+    p.add_argument("--dataset", choices=["cmeee", "imcs", "yidu", "all"], default="all")
+    p.add_argument("--split", choices=["train", "dev", "test", "all"], default="all")
+    p.add_argument("--step", type=int, choices=[1, 2, 3, 4], default=None)
+    p.add_argument("--no-step3", action="store_true")
+    p.add_argument("--no-reflect", action="store_true")
+    p.add_argument("--no-kgfilter", action="store_true")
+    p.add_argument("--cmeee-long-min", type=int, default=5)
+    p.add_argument("--preanalysis-only", action="store_true")
+    return p.parse_args()
 
 
-def get_output_path(prefix: str, dataset: str, split: str) -> str:
-    """生成输出文件路径"""
+def get_path(prefix, ds, split):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, f"{prefix}{dataset}_{split}.json")
+    return os.path.join(OUTPUT_DIR, f"{prefix}{ds}_{split}.json")
 
 
-def load_existing(path: str):
-    """加载已有的中间结果"""
+def load_existing(path):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
-def run_cmeee(args, few_shot_str: str, cmeee_vocab: list, norm_vocab: list):
-    """运行 CMeEE 全量流程"""
+def save_json(data, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def apply_kg_filter(items, kg, field_in, field_out):
+    """对 items 的 field_in 字符串实体列表做 KG 相似度过滤，输出到 field_out。"""
+    for it in items:
+        ents = clean_entity_list(it.get(field_in, ""))
+        if not ents:
+            it[field_out] = ""
+            continue
+        kept = kg.filter_by_similarity(
+            ents, threshold=HIGH_SIM_THRESHOLD, skip_normalized=True,
+        )
+        it[field_out] = ",".join(kept)
+    return items
+
+
+def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
     splits_cfg = DATASET_SPLITS["CMeEE_V2"]
-    target_splits = [s for s in splits_cfg
-                     if args.split == "all" or s["split"] == args.split]
+    targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
     limit = 20 if args.quick_test else None
-    all_results = []
+    eval_results = []
 
-    for split_cfg in target_splits:
-        split = split_cfg["split"]
-        has_label = split_cfg["has_label"]
-        print(f"\n{'='*60}")
-        print(f"  🔵 CMeEE [{split}]  has_label={has_label}")
-        print(f"{'='*60}")
+    for sc in targets:
+        split, has_label = sc["split"], sc["has_label"]
+        print(f"\n{'='*60}\n  🔵 CMeEE [{split}] has_label={has_label}\n{'='*60}")
+        p1  = get_path(STEP1_PREFIX,  "CMeEE_V2", split)
+        p1e = get_path(STEP1E_PREFIX, "CMeEE_V2", split)
+        p2  = get_path(STEP2_PREFIX,  "CMeEE_V2", split)
+        p3  = get_path(STEP3_PREFIX,  "CMeEE_V2", split)
 
-        step1_path  = get_output_path(STEP1_PREFIX,  "CMeEE_V2", split)
-        step1e_path = get_output_path(STEP1E_PREFIX, "CMeEE_V2", split)
-        step2_path  = get_output_path(STEP2_PREFIX,  "CMeEE_V2", split)
-        step3_path  = get_output_path(STEP3_PREFIX,  "CMeEE_V2", split)
-
-        # ---- Step 1: 大模型抽取 ----
         if args.step is None or args.step == 1:
-            items = extract_cmeee_split(split, few_shot_str, step1_path, limit=limit)
+            items = extract_cmeee_split(split, few_shot_str, p1, limit=limit)
         else:
-            items = load_existing(step1_path)
+            items = load_existing(p1)
             if items is None:
-                print(f"  ⚠️  Step1 输出不存在，跳过 CMeEE {split}")
-                continue
+                print(f"  ⚠️ 缺 Step1 输出，跳过"); continue
 
-        # ---- Step 1.5: 嵌套实体扩展 ----
         if args.step is None or args.step == 1:
-            print(f"\n[Step1.5] CMeEE [{split}] 嵌套实体扩展...")
+            print(f"[Step1.5] 嵌套扩展…")
             items = enrich_cmeee_step1(items, cmeee_vocab, long_min_len=args.cmeee_long_min)
-            with open(step1e_path, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
-            print(f"  ✅ CMeEE [{split}] Step1.5 保存至: {step1e_path}")
+            save_json(items, p1e)
         else:
-            enriched = load_existing(step1e_path)
-            if enriched:
-                items = enriched
+            tmp = load_existing(p1e)
+            if tmp: items = tmp
 
-        # ---- Step 2: 图谱对齐 ----
+        # 反思（可选）
+        if not args.no_reflect and (args.step is None or args.step == 2):
+            print("[Step1.7] DeepSeek 反思校验…")
+            items = reflect_cmeee(items)
+            # 反思结果反哺到 enriched_output（保持后续兼容）
+            for it in items:
+                if it.get("reflected_output"):
+                    it["step1_enriched_output"] = it["reflected_output"]
+            save_json(items, p1e)
+
         if args.step is None or args.step == 2:
-            items = align_cmeee_split(items, cmeee_vocab, step2_path)
+            items = align_cmeee_split(items, cmeee_vocab, p2)
         else:
-            step2_data = load_existing(step2_path)
-            if step2_data:
-                items = step2_data
+            tmp = load_existing(p2)
+            if tmp: items = tmp
 
-        # ---- Step 3: 规则过滤 ----
+        # KG 相似度过滤
+        if not args.no_kgfilter and (args.step is None or args.step in (2, 3)):
+            print(f"[Step2.5] KG 余弦过滤（≥{HIGH_SIM_THRESHOLD}）…")
+            items = apply_kg_filter(items, kg,
+                                    field_in="step2_aligned_output",
+                                    field_out="step2_aligned_output")
+            save_json(items, p2)
+
         if not args.no_step3 and (args.step is None or args.step == 3):
-            items = filter_cmeee(items, step3_path)
+            items = filter_cmeee(items, p3)
         elif args.no_step3:
-            # 跳过Step3，用Step2结果
-            for item in items:
-                if "step3_final_output" not in item:
-                    item["step3_final_output"] = item.get("step2_aligned_output", "")
+            for it in items:
+                it.setdefault("step3_final_output", it.get("step2_aligned_output", ""))
+            save_json(items, p3)
 
-        # ---- Step 4: 评估 ----
         if has_label and (args.step is None or args.step == 4):
-            result = evaluate_cmeee(items, split)
-            all_results.append(result)
+            eval_results.append(evaluate_cmeee(items, split))
         elif not has_label:
-            print(f"  ℹ️  CMeEE [{split}] 无标注，跳过 F1 评估，只输出提取结果")
+            print(f"  ℹ️ {split} 无标注，跳过评估")
+    return eval_results
 
-    return all_results
 
-
-def run_imcs(args, few_shot_str: str, norm_vocab: list):
-    """运行 IMCS 全量流程"""
+def run_imcs(args, few_shot_str, norm_vocab, kg):
     splits_cfg = DATASET_SPLITS["IMCS_V2"]
-    target_splits = [s for s in splits_cfg
-                     if args.split == "all" or s["split"] == args.split]
+    targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
     limit = 20 if args.quick_test else None
-    all_results = []
+    eval_results = []
 
-    for split_cfg in target_splits:
-        split = split_cfg["split"]
-        has_label = split_cfg["has_label"]
-        print(f"\n{'='*60}")
-        print(f"  🟢 IMCS [{split}]  has_label={has_label}")
-        print(f"{'='*60}")
+    for sc in targets:
+        split, has_label = sc["split"], sc["has_label"]
+        print(f"\n{'='*60}\n  🟢 IMCS [{split}] has_label={has_label}\n{'='*60}")
+        p1 = get_path(STEP1_PREFIX, "IMCS_V2", split)
+        p2 = get_path(STEP2_PREFIX, "IMCS_V2", split)
+        p3 = get_path(STEP3_PREFIX, "IMCS_V2", split)
 
-        step1_path = get_output_path(STEP1_PREFIX,  "IMCS_V2", split)
-        step2_path = get_output_path(STEP2_PREFIX,  "IMCS_V2", split)
-        step3_path = get_output_path(STEP3_PREFIX,  "IMCS_V2", split)
-
-        # ---- Step 1: 大模型抽取 ----
         if args.step is None or args.step == 1:
-            items = extract_imcs_split(split, few_shot_str, step1_path, limit=limit)
+            items = extract_imcs_split(split, few_shot_str, p1, limit=limit)
         else:
-            items = load_existing(step1_path)
+            items = load_existing(p1)
             if items is None:
-                print(f"  ⚠️  Step1 输出不存在，跳过 IMCS {split}")
-                continue
+                print(f"  ⚠️ 缺 Step1 输出"); continue
 
-        # ---- Step 2: 图谱对齐 ----
+        if not args.no_reflect and (args.step is None or args.step == 2):
+            print("[Step1.7] DeepSeek 反思校验…")
+            items = reflect_imcs(items)
+            for it in items:
+                if it.get("reflected_output"):
+                    it["step1_raw_output"] = it["reflected_output"]
+            save_json(items, p1)
+
         if args.step is None or args.step == 2:
-            items = align_imcs_split(items, norm_vocab, step2_path)
+            items = align_imcs_split(items, norm_vocab, p2)
         else:
-            step2_data = load_existing(step2_path)
-            if step2_data:
-                items = step2_data
+            tmp = load_existing(p2)
+            if tmp: items = tmp
 
-        # ---- Step 3: 大模型过滤 ----
+        # KG 过滤：IMCS 标准词由 kg 模块自动跳过
+        if not args.no_kgfilter and (args.step is None or args.step in (2, 3)):
+            print(f"[Step2.5] KG 余弦过滤（IMCS 标准词跳过）…")
+            items = apply_kg_filter(items, kg,
+                                    field_in="step2_aligned_output",
+                                    field_out="step2_aligned_output")
+            save_json(items, p2)
+
         if not args.no_step3 and (args.step is None or args.step == 3):
-            items = filter_imcs_with_llm(items, step3_path)
+            items = filter_imcs_with_llm(items, p3)
         elif args.no_step3:
-            for item in items:
-                if "step3_final_output" not in item:
-                    item["step3_final_output"] = item.get("step2_aligned_output", "")
+            for it in items:
+                it.setdefault("step3_final_output", it.get("step2_aligned_output", ""))
+            save_json(items, p3)
 
-        # ---- Step 4: 双 F1 评估 ----
         if has_label and (args.step is None or args.step == 4):
-            result = evaluate_imcs(items, split, norm_vocab)
-            all_results.append(result)
+            eval_results.append(evaluate_imcs(items, split, norm_vocab))
         elif not has_label:
-            print(f"  ℹ️  IMCS [{split}] 无标注，跳过 F1 评估，只输出提取结果")
+            print(f"  ℹ️ {split} 无标注，跳过评估")
+    return eval_results
 
-    return all_results
 
-
-def run_yidu(args, few_shot_str: str):
-    """运行 yidu_4k 提取流程（只提取，不评估）"""
-    print(f"\n{'='*60}")
-    print(f"  🟡 yidu_4k [train]  只提取，不评估 F1")
-    print(f"{'='*60}")
-
-    output_path = get_output_path(STEP1_PREFIX, "yidu_4k", "train")
+def run_yidu(args, few_shot_str, kg):
+    print(f"\n{'='*60}\n  🟡 yidu_4k [train]\n{'='*60}")
+    p1 = get_path(STEP1_PREFIX, "yidu_4k", "train")
     limit = 20 if args.quick_test else None
-
     if args.step is None or args.step == 1:
-        extract_yidu(few_shot_str, output_path, limit=limit)
+        items = extract_yidu(few_shot_str, p1, limit=limit)
     else:
-        print(f"  ℹ️  yidu 只有 Step1，跳过")
+        items = load_existing(p1) or []
+    if items and not args.no_reflect:
+        print("[Step1.7] DeepSeek 反思校验…")
+        items = reflect_yidu(items)
+        for it in items:
+            if it.get("reflected_output"):
+                it["step1_raw_output"] = it["reflected_output"]
+        save_json(items, p1)
+    if items and not args.no_kgfilter:
+        print(f"[Step2.5] KG 余弦过滤（≥{HIGH_SIM_THRESHOLD}）…")
+        items = apply_kg_filter(items, kg,
+                                field_in="step1_raw_output",
+                                field_out="step1_raw_output")
+        save_json(items, p1)
 
 
 def main():
     args = parse_args()
-    start_time = time.time()
-
-    print("\n" + "="*60)
-    print("  🏥 医疗NER框架 v3 启动")
-    print(f"  数据集: {args.dataset}  Split: {args.split}")
-    print(f"  快速测试: {args.quick_test}  跳过Step3: {args.no_step3}")
-    print("="*60)
-
+    t0 = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"\n{'='*60}\n  🏥 医疗 NER 框架 v4\n{'='*60}")
 
-    # ==================== 全局初始化 ====================
-    # 少样本示例：只从 train 集提取一次，全局复用
-    cmeee_few_shot_str, imcs_few_shot_str = build_global_few_shot()
+    # ----- 阶段 2 前置: 预学习 100 条 -----
+    print("\n[Phase] 预学习 (per dataset, 100 samples)…")
+    pre = run_preanalysis()
+    for ds, rep in pre.items():
+        if "error" not in rep:
+            print(f"  {ds} skills: {rep.get('skills')}")
+    if args.preanalysis_only:
+        print("✅ preanalysis-only 已完成"); return
 
-    # CMeEE 词汇表（用于 Step1.5 嵌套扩展）
-    print("\n[Init] 构建 CMeEE 词汇表...")
+    # ----- 少样本（含 skills 注入）-----
+    cmeee_fs, imcs_fs = build_global_few_shot()
+    if pre.get("CMeEE_V2", {}).get("skills"):
+        cmeee_fs = render_skills_block(pre["CMeEE_V2"]) + "\n\n" + cmeee_fs
+    if pre.get("IMCS_V2", {}).get("skills"):
+        imcs_fs = render_skills_block(pre["IMCS_V2"]) + "\n\n" + imcs_fs
+
+    # ----- 全局资源 -----
     try:
-        cmeee_train = load_cmeee("train")
-        cmeee_vocab = build_cmeee_entity_vocab(cmeee_train)
-        print(f"  CMeEE 词汇表大小: {len(cmeee_vocab)}")
+        cmeee_vocab = build_cmeee_entity_vocab(load_cmeee("train"))
     except Exception as e:
-        print(f"  ⚠️  CMeEE 词汇表构建失败: {e}，使用空词汇表")
-        cmeee_vocab = []
-
-    # IMCS 归一化词典（官方 symptom_norm.csv 或从 train 提取）
-    print("\n[Init] 加载 IMCS 归一化词典...")
+        print(f"  ⚠️ CMeEE 词表失败: {e}"); cmeee_vocab = []
     norm_vocab = build_imcs_norm_vocab()
+    kg = load_kg()
 
-    # ==================== 运行各数据集 ====================
-    all_eval_results = []
-
+    # ----- 分发 -----
+    all_eval = []
     if args.dataset in ("cmeee", "all"):
-        results = run_cmeee(args, cmeee_few_shot_str, cmeee_vocab, norm_vocab)
-        all_eval_results.extend(results)
-
+        all_eval.extend(run_cmeee(args, cmeee_fs, cmeee_vocab, kg))
     if args.dataset in ("imcs", "all"):
-        results = run_imcs(args, imcs_few_shot_str, norm_vocab)
-        all_eval_results.extend(results)
-
+        all_eval.extend(run_imcs(args, imcs_fs, norm_vocab, kg))
     if args.dataset in ("yidu", "all"):
-        run_yidu(args, cmeee_few_shot_str)
+        run_yidu(args, cmeee_fs, kg)
 
-    # ==================== 生成汇总报告 ====================
-    if all_eval_results:
-        report_path = os.path.join(OUTPUT_DIR, "evaluation_report.md")
-        generate_full_report(all_eval_results, report_path)
+    if all_eval:
+        rep_md   = os.path.join(OUTPUT_DIR, "evaluation_report.md")
+        rep_json = os.path.join(OUTPUT_DIR, "evaluation_report.json")
+        generate_full_report(all_eval, rep_md)
+        with open(rep_json, "w", encoding="utf-8") as f:
+            json.dump(all_eval, f, ensure_ascii=False, indent=2)
 
-        # 保存 JSON 格式报告
-        json_report_path = os.path.join(OUTPUT_DIR, "evaluation_report.json")
-        with open(json_report_path, "w", encoding="utf-8") as f:
-            json.dump(all_eval_results, f, ensure_ascii=False, indent=2)
-
-    elapsed = time.time() - start_time
-    print(f"\n✅ 全部完成！总耗时: {elapsed/60:.1f} 分钟")
-    print(f"📁 输出目录: {OUTPUT_DIR}")
+    print(f"\n✅ 全部完成，耗时 {(time.time()-t0)/60:.1f} 分钟")
+    print(f"📁 输出: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
