@@ -32,10 +32,10 @@ from src.data_processor import (
 )
 
 # ==================== batch_size 配置 ====================
-# 5090 32GB BF16：CMeEE 短文本 batch=8，IMCS 轮次 batch=16
-# 若出现 OOM，llm_client 会自动降级为逐条推理，或在此处改小
-CMEEE_BATCH_SIZE     = 8   # CMeEE/yidu 每批处理条数（OOM 时改为 4）
-IMCS_TURN_BATCH_SIZE = 16  # IMCS 每批处理的对话轮次数（OOM 时改为 8）
+# 从 config 读 5090 优化默认值；OOM 时 llm_client 会自动降级
+from config.config import LLM_BATCH_SIZE_CMEEE, LLM_BATCH_SIZE_IMCS
+CMEEE_BATCH_SIZE     = LLM_BATCH_SIZE_CMEEE   # 5090: 12
+IMCS_TURN_BATCH_SIZE = LLM_BATCH_SIZE_IMCS    # 5090: 24
 
 
 # ==================== Prompt 构建（精简版）====================

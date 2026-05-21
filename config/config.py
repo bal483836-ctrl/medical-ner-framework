@@ -62,6 +62,15 @@ LLM_USE_4BIT           = os.environ.get("MNER_USE_4BIT", "false").lower() == "tr
 LLM_USE_FLASH_ATTN     = os.environ.get("MNER_USE_FLASH_ATTN", "false").lower() == "true"
 LLM_DEVICE_MAP         = "auto"
 
+# ==================== RTX 5090 优化（32GB 显存 / Blackwell sm_120）====================
+# 默认按 5090 跑：BF16 全精度，大 batch，启用 SDPA
+# 显存不足时设 MNER_USE_4BIT=true
+LLM_BATCH_SIZE_CMEEE = int(os.environ.get("MNER_BATCH_CMEEE", "12"))   # 5090: 12; 5090-4bit: 16; 24GB 卡: 6
+LLM_BATCH_SIZE_IMCS  = int(os.environ.get("MNER_BATCH_IMCS",  "24"))   # 短文本，可以更大
+LLM_BATCH_SIZE_ASSERT = int(os.environ.get("MNER_BATCH_ASSERT", "16"))
+# 全局随机种子（所有阶段共用）
+GLOBAL_SEED = 42
+
 # ==================== 向量模型 ====================
 EMBEDDING_BATCH_SIZE = 256
 EMBEDDING_DIM        = 1024

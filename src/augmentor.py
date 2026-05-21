@@ -22,6 +22,7 @@ from config.config import (
 )
 from src.llm_client import batch_generate
 from src.assertion_annotator import annotate
+from src.utils import set_global_seed
 
 AUG_BATCH = 8
 
@@ -67,6 +68,7 @@ def augment(samples: List[Dict],
     把每个少数类增强到 max_count * target_ratio 条左右。
     增强后做 LLM 二次断言确认。
     """
+    set_global_seed()   # 增强采样的可复现性
     counts = label_counts(samples)
     max_n = max(counts.values()) if counts else 0
     target_n = int(max_n * target_ratio)

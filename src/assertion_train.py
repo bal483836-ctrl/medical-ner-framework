@@ -218,12 +218,16 @@ def train(train_samples: List[Dict], dev_samples: List[Dict],
 
     save_dir = save_dir or os.path.join(OUTPUT_DIR, "assertion_clf")
     os.makedirs(save_dir, exist_ok=True)
-    _set_seed(seed_override if seed_override is not None else CLF_SEED)
+    seed_used = seed_override if seed_override is not None else CLF_SEED
+    _set_seed(seed_used)
 
     pool = train_samples + dev_samples
-    tr_split, val_split = group_split(pool, val_ratio=0.1)
-    print(f"  [Train] train={len(tr_split)}  val={len(val_split)}")
-    print(f"  [Train] 标签分布(train): {Counter(s['label'] for s in tr_split)}")
+    tr_split, val_split = group_split(pool, val_ratio=0.1, seed=seed_used)
+    print(f"  [Train] seed={seed_used}  train={len(tr_split)}  val={len(val_split)}")
+    tr_cnt = Counter(s["label"] for s in tr_split)
+    va_cnt = Counter(s["label"] for s in val_split)
+    print(f"  [Train] train 标签分布: {dict(tr_cnt)}")
+    print(f"  [Train] val   标签分布: {dict(va_cnt)}")
 
     tok = AutoTokenizer.from_pretrained(CLASSIFIER_BASE_PATH)
     cfg = AutoConfig.from_pretrained(
