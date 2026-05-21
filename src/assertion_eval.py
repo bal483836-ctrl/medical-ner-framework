@@ -1,7 +1,7 @@
 """
-断言小模型评估（阶段 9）
+断言小模型评估（阶段 9）— v4.1
 目标：macro F1 ≥ 0.90
-test split 数据完全独立，未参与训练。
+test split 严格独立，未参与训练。
 """
 import json
 import os
@@ -13,11 +13,12 @@ from config.config import (
     ASSERTION_LABELS, ASSERTION_LABEL2ID, OUTPUT_DIR,
     F1_TARGET_ASSERTION, CLF_MAX_LEN, CLF_BATCH_SIZE,
 )
-from src.assertion_train import _serialize
+from src.assertion_train import serialize
 
 
 def evaluate(model_dir: str, test_samples: List[Dict],
              save_report: bool = True) -> Dict:
+    import numpy as np
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     from sklearn.metrics import (
@@ -36,13 +37,14 @@ def evaluate(model_dir: str, test_samples: List[Dict],
     preds, golds = [], []
     for bs in range(0, len(samples), CLF_BATCH_SIZE):
         batch = samples[bs: bs + CLF_BATCH_SIZE]
-        texts = [_serialize(s) for s in batch]
-        enc = tok(texts, padding=True, truncation=True,
+        pairs = [serialize(s) for s in batch]
+        queries  = [p[0] for p in pairs]
+        contexts = [p[1] for p in pairs]
+        enc = tok(queries, contexts, padding=True, truncation=True,
                   max_length=CLF_MAX_LEN, return_tensors="pt").to(device)
         with torch.no_grad():
             logits = model(**enc).logits
-        p = logits.argmax(-1).cpu().tolist()
-        preds.extend(p)
+        preds.extend(logits.argmax(-1).cpu().tolist())
         golds.extend(ASSERTION_LABEL2ID[s["label"]] for s in batch)
 
     macro = f1_score(golds, preds, average="macro")
@@ -51,7 +53,7 @@ def evaluate(model_dir: str, test_samples: List[Dict],
         golds, preds, target_names=ASSERTION_LABELS,
         digits=4, zero_division=0,
     )
-    cm = confusion_matrix(golds, preds).tolist()
+    cm = confusion_matrix(golds, preds, labels=list(range(len(ASSERTION_LABELS)))).tolist()
 
     result = {
         "n_test": len(samples),

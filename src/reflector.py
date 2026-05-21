@@ -1,37 +1,58 @@
 """
-DeepSeek 反思模块（NER Step 2.5）
-对 Step1 输出的实体集合做一次质量复核：
-  - 删除非实体噪声
-  - 补漏明显遗漏
-  - 不修改 IMCS 已经归一化的标准词
+DeepSeek CoT 反思（NER Step 1.7）— v4.1
+吸取 v21 unified_prompt 的 <thinking>...</thinking><answer>...</answer> 格式
 
-输入：[{text/sentence, step1_raw_output}], 输出更新 reflected_output 字段
+策略：让反思模型先在 <thinking> 里逐项分析，再在 <answer> 里输出最终实体列表。
 """
 import json
 import os
+import re
 import sys
 from typing import List, Dict
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.llm_client import batch_generate, clean_llm_output
+from src.llm_client import batch_generate
 from src.data_processor import clean_entity_list
 
 REFLECT_BATCH = 8
 
 
-def _prompt(text: str, entities: List[str], domain_hint: str) -> str:
-    ent_str = ", ".join(entities) if entities else "（空）"
-    return f"""你是医学实体审核专家。{domain_hint}
-原文：{text}
-当前抽取实体：{ent_str}
+def _cot_prompt(text: str, entities: List[str], domain_hint: str) -> str:
+    cand = "、".join(entities) if entities else "无"
+    return f"""你是医学审稿专家。{domain_hint}逐项审查下列候选实体。
 
-任务：审核上述实体清单。
-1) 删除明显不是医学实体或不在原文中的噪声；
-2) 补充原文中明显遗漏的医学实体；
-3) 保留原文写法，不要做归一化。
-直接输出最终实体清单，逗号分隔，不要解释。
-最终："""
+# 原文
+{text}
+
+# 候选实体
+{cand}
+
+# 审查规则
+1. 候选必须字面出现在原文中
+2. 否定句中的症状（「不发烧」「未见」）应删除
+3. 询问句中的症状应删除
+4. 不属于该数据集目标实体的应删除
+5. 不要新增原文中没有的实体
+
+# 输出格式（必须严格遵守）
+<thinking>
+逐项分析每个候选实体...
+</thinking>
+<answer>
+最终实体列表（用顿号"、"分隔，无则输出"无"）
+</answer>"""
+
+
+def _parse_answer(text: str) -> List[str]:
+    """从 <answer>...</answer> 中提取实体；缺失时正则兜底。"""
+    if not text:
+        return []
+    text = re.sub(r"```[a-z]*|```", "", text)
+    m = re.search(r"<answer>([\s\S]*?)</answer>", text, re.IGNORECASE)
+    body = m.group(1) if m else text
+    body = re.sub(r"<think(ing)?>[\s\S]*?</think(ing)?>", "", body, flags=re.IGNORECASE)
+    return clean_entity_list(body)
 
 
 def reflect_batch(items: List[Dict], text_field: str,
@@ -47,42 +68,41 @@ def reflect_batch(items: List[Dict], text_field: str,
 
     for bs in tqdm(range(0, len(pending), REFLECT_BATCH), desc="reflect"):
         batch = pending[bs:bs + REFLECT_BATCH]
-        prompts = [_prompt(t, e, domain_hint) for _, t, e in batch]
-        resps = batch_generate(prompts, max_tokens=256, model_name="reflect")
+        prompts = [_cot_prompt(t, e, domain_hint) for _, t, e in batch]
+        resps = batch_generate(prompts, max_tokens=512, model_name="reflect")
         for (idx, text, _), r in zip(batch, resps):
-            cleaned = clean_entity_list(clean_llm_output(r))
-            # 锚定回原文，丢掉幻觉
-            anchored = [e for e in cleaned if e in text]
+            ents = _parse_answer(r)
+            # 锚定回原文，防幻觉
+            anchored = [e for e in ents if e in text]
             items[idx][out_field] = ",".join(dict.fromkeys(anchored))
     return items
 
 
-def reflect_cmeee(items: List[Dict]) -> List[Dict]:
+def reflect_cmeee(items):
     return reflect_batch(
         items, text_field="text",
         in_field="step1_enriched_output", out_field="reflected_output",
-        domain_hint="数据集为 CMeEE，关注疾病/症状/手术/药物/检查/身体部位等。",
+        domain_hint="数据集为 CMeEE_V2，9 类实体（dis/sym/pro/equ/dru/ite/bod/mic/dep）。",
     )
 
 
-def reflect_imcs(items: List[Dict]) -> List[Dict]:
-    """IMCS：按 self_report+全部 sentence 拼成 text。"""
+def reflect_imcs(items):
     for it in items:
-        it["_full_text"] = it.get("self_report", "") + " " + " ".join(
+        it["_full_text"] = (it.get("self_report") or "") + " " + " ".join(
             t.get("sentence", "") for t in it.get("dialogue", []))
     res = reflect_batch(
         items, text_field="_full_text",
         in_field="step1_raw_output", out_field="reflected_output",
-        domain_hint="数据集为 IMCS 儿科对话，关注患者陈述的症状原词，不要做归一化。",
+        domain_hint="数据集为 IMCS_V2 儿科对话，抽原文症状形态，不归一化。",
     )
     for it in res:
         it.pop("_full_text", None)
     return res
 
 
-def reflect_yidu(items: List[Dict]) -> List[Dict]:
+def reflect_yidu(items):
     return reflect_batch(
         items, text_field="text",
         in_field="step1_raw_output", out_field="reflected_output",
-        domain_hint="数据集为电子病历，关注疾病诊断、检查指标、药物等。",
+        domain_hint="数据集为电子病历，关注疾病/影像/检验/药物/解剖/手术 6 类。",
     )

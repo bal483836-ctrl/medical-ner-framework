@@ -1,10 +1,22 @@
-# 医疗 NER + 断言训练框架 v4
+# 医疗 NER + 断言训练框架 v4.1
 
 零样本医疗命名实体识别 + 4 类断言分类的科研级流水线。
 
 - **NER 目标**：Micro F1 ≥ 0.80（CMeEE_V2、IMCS_V2）
 - **断言目标**：Macro F1 ≥ 0.90（4 类：确定 / 疑似 / 无 / 知识事实）
 - **严格防数据泄露**：test split 全程不参与训练；分类器按文档分组划分内部 val。
+
+## v4.1 升级要点（吸取 v21 + 旧版断言代码精华）
+
+| 模块 | 升级 |
+|---|---|
+| 预学习 | LLM 自动归纳 skills（看 30 条样本生成"看到 X 做 Y"规则）+ 文件缓存 |
+| KG | 直接加载 `data/entities_dict.txt` + `data/triples.txt`（60K 节点 / 354K 三元组） |
+| 反思 | DeepSeek CoT 格式 `<thinking>...</thinking><answer>...</answer>` |
+| 动态窗口 | BGE 语义 × 10 + spaCy 句法依存 × 5 + 否定关键词 × 3 - 距离惩罚 |
+| 断言标注 | Entity Marker `[E]...[/E]` 消歧 + JSON 输出 + KG 知识参考 |
+| 分类器 | **FocalLoss(γ=1.6) + FGM 对抗(ε=0.11) + 类权重 + 实体标记【】** |
+| yidu | 自动识别新版 JSON / 旧版 BIO |
 
 ---
 

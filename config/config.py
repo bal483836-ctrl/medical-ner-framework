@@ -21,14 +21,25 @@ IMCS_TRAIN_PATH  = os.path.join(DATA_ROOT, "IMCS_V2", "IMCS_V2_train_new.json")
 IMCS_DEV_PATH    = os.path.join(DATA_ROOT, "IMCS_V2", "IMCS_V2_dev_new.json")
 IMCS_TEST_PATH   = os.path.join(DATA_ROOT, "IMCS_V2", "IMCS_V2_test_new.json")
 
-YIDU_TRAIN_PATH  = os.path.join(DATA_ROOT, "yidu_4k", "subtask1_training.txt")
+# yidu_4k：优先新版 JSON 格式（new_yidu_4k_*.json，带标注），缺失时回退 BIO
+_YIDU_NEW_TRAIN = os.path.join(DATA_ROOT, "yidu", "new_yidu_4k_train.json")
+_YIDU_NEW_DEV   = os.path.join(DATA_ROOT, "yidu", "new_yidu_4k_dev.json")
+_YIDU_NEW_TEST  = os.path.join(DATA_ROOT, "yidu", "new_yidu_4k_test.json")
+_YIDU_OLD_BIO   = os.path.join(DATA_ROOT, "yidu_4k", "subtask1_training.txt")
+YIDU_TRAIN_PATH = _YIDU_NEW_TRAIN if os.path.exists(_YIDU_NEW_TRAIN) else _YIDU_OLD_BIO
+YIDU_DEV_PATH   = _YIDU_NEW_DEV   if os.path.exists(_YIDU_NEW_DEV)   else None
+YIDU_TEST_PATH  = _YIDU_NEW_TEST  if os.path.exists(_YIDU_NEW_TEST)  else None
 
 SYMPTOM_NORM_CSV    = os.path.join(BASE_DIR, "data", "symptom_norm.csv")
 IMCS_NORM_DICT_PATH = SYMPTOM_NORM_CSV if os.path.exists(SYMPTOM_NORM_CSV) \
                       else os.path.join(DATA_ROOT, "symptom_norm.csv")
 
-# 外部知识图谱文件（用户后续提供路径；不存在时降级为训练集词典）
-KG_PATH = os.environ.get("MNER_KG_PATH", os.path.join(DATA_ROOT, "kg", "medical_kg.json"))
+# 外部知识图谱文件
+# 优先用 entities_dict.txt + triples.txt（CMKG 风格，已随仓库附带）
+KG_DICT_PATH    = os.environ.get("MNER_KG_DICT",    os.path.join(BASE_DIR, "data", "entities_dict.txt"))
+KG_TRIPLES_PATH = os.environ.get("MNER_KG_TRIPLES", os.path.join(BASE_DIR, "data", "triples.txt"))
+# 兼容 JSON 格式 KG（若提供）
+KG_PATH         = os.environ.get("MNER_KG_PATH",    os.path.join(DATA_ROOT, "kg", "medical_kg.json"))
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 
@@ -78,12 +89,19 @@ CMEEE_TARGET_TYPES = list(CMEEE_TYPE_MAP.keys())
 IMCS_TARGET_SYMPTOM_TYPES = ["1", "2"]
 
 # ==================== 断言标签（4 类）====================
-# 确定：明确确认实体存在 / 阳性
-# 疑似：推断、可能、考虑、不排除
-# 无：明确否认 / 阴性 / 排除
-# 知识事实：通用医学事实陈述，非针对具体患者
+# 确定 (Present)   ：明确确认实体存在 / 阳性
+# 疑似 (Possible)  ：推断、可能、考虑、不排除
+# 无 (Absent)      ：明确否认 / 阴性 / 排除
+# 知识事实 (General)：通用医学事实陈述，非针对具体患者
 ASSERTION_LABELS = ["确定", "疑似", "无", "知识事实"]
 ASSERTION_LABEL2ID = {l: i for i, l in enumerate(ASSERTION_LABELS)}
+# LLM 英文输出 → 中文标签
+ASSERTION_EN2ZH = {
+    "Present": "确定", "Positive": "确定", "阳性": "确定",
+    "Possible": "疑似", "Suspected": "疑似", "可能": "疑似", "疑似": "疑似",
+    "Absent": "无", "Negative": "无", "否定": "无", "阴性": "无",
+    "General": "知识事实", "Factual": "知识事实", "一般性描述": "知识事实",
+}
 
 # ==================== 动态语境窗口 ====================
 # 普通文本：实体前后字符数
@@ -96,14 +114,18 @@ F1_TARGET_NER       = 0.80
 F1_TARGET_ASSERTION = 0.90
 DUAL_F1_EVAL        = True
 
-# ==================== 分类器训练超参 ====================
-CLF_MAX_LEN       = 256
-CLF_BATCH_SIZE    = 32
-CLF_LEARNING_RATE = 2e-5
-CLF_EPOCHS        = 5
-CLF_WARMUP_RATIO  = 0.1
+# ==================== 分类器训练超参（吸取 Optuna 黄金参数）====================
+CLF_MAX_LEN       = 512
+CLF_BATCH_SIZE    = 16
+CLF_LEARNING_RATE = 3.38e-5       # Optuna 搜索值
+CLF_EPOCHS        = 7
+CLF_WARMUP_RATIO  = 0.13
 CLF_WEIGHT_DECAY  = 0.01
 CLF_SEED          = 42
+# Focal Loss + FGM 对抗训练（关键提分点）
+CLF_FOCAL_GAMMA   = 1.6
+CLF_FGM_EPS       = 0.11
+CLF_HIDDEN_DROPOUT = 0.15
 
 # ==================== 数据增强 ====================
 # 当某断言类别样本占比低于该阈值，触发增强

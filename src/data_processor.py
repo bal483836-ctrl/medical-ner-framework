@@ -354,14 +354,25 @@ def _extract_literal_from_bio(sentence: str, bio_label: str) -> List[str]:
 
 def load_yidu(path: str = None) -> List[Dict]:
     """
-    加载 yidu_4k 数据集（BIO格式，每行：字 标签）
-    空行分隔不同句子
-    返回格式：[{"text": str, "tokens": [...], "labels": [...]}]
+    加载 yidu_4k 数据集。自动识别两种格式：
+      A) BIO 格式（旧）：每行"字 标签"，空行分句
+      B) JSON 格式（new_yidu_4k_*.json）：[{id, text, entities:[{start_idx,end_idx,entity,type,symptom_norm,symptom_type}]}]
+    返回统一格式 [{"text", "tokens?", "labels?", "entities?"}]
     """
     path = path or YIDU_TRAIN_PATH
     if not os.path.exists(path):
         raise FileNotFoundError(f"yidu 文件不存在: {path}")
 
+    # JSON 格式直接读
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            print(f"  [DataLoader] yidu (JSON) {os.path.basename(path)}: {len(data)} 条")
+            return data
+        raise ValueError(f"yidu JSON 必须是列表，得到 {type(data)}")
+
+    # BIO 格式
     samples = []
     tokens, labels = [], []
 
@@ -397,24 +408,28 @@ def load_yidu(path: str = None) -> List[Dict]:
 
 
 def extract_yidu_gold_entities(sample: Dict) -> List[str]:
-    """从 yidu BIO 标注中提取 Gold 实体（用于验证，实际不做F1评估）"""
+    """从 yidu Gold 标注提取实体名（兼容 JSON 和 BIO 两种）"""
+    # JSON 格式
+    if "entities" in sample and isinstance(sample["entities"], list):
+        names, seen = [], set()
+        for e in sample["entities"]:
+            nm = (e.get("entity") or e.get("mention") or "").strip()
+            if nm and nm not in seen:
+                seen.add(nm); names.append(nm)
+        return names
+    # BIO 格式
     tokens = sample.get("tokens", [])
     labels = sample.get("labels", [])
-    entities = []
-    current = []
+    entities, current = [], []
     for token, label in zip(tokens, labels):
         if label.startswith("B-"):
-            if current:
-                entities.append("".join(current))
+            if current: entities.append("".join(current))
             current = [token]
         elif label.startswith("I-") and current:
             current.append(token)
         else:
-            if current:
-                entities.append("".join(current))
-                current = []
-    if current:
-        entities.append("".join(current))
+            if current: entities.append("".join(current)); current = []
+    if current: entities.append("".join(current))
     return list(dict.fromkeys([e for e in entities if e]))
 
 
