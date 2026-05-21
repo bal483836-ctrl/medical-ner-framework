@@ -1,22 +1,25 @@
 """
-LLM 断言标注（阶段 6）—— v4.1
+LLM 断言标注（阶段 6）—— v4.2
 
-关键升级（吸取 run_llm_assertion.py）：
-  1. Entity Marker：[E]...[/E] 包裹目标实体，避免同名实体歧义
-  2. JSON 输出格式，正则 + json 双重兜底解析
-  3. 4 类标签：Present/Possible/Absent/General → 确定/疑似/无/知识事实
-  4. 加入 KG 知识进 prompt，提升对"知识事实"类的判定准确度
+升级（在 v4.1 基础上）：
+  1. Entity Marker：[E]...[/E] 包裹目标实体
+  2. JSON 输出 + 正则双重兜底
+  3. KG 知识参考（含 possible_diseases 反向索引）
+  4. **自洽投票（self-consistency）**：同一样本跑 N 次（带不同提示扰动），
+     取多数票。减少 LLM 标注噪声 → 显著提升下游分类器上限。
 """
 import json
 import os
 import re
 import sys
+from collections import Counter
 from typing import Dict, List
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import (
     ASSERTION_LABELS, ASSERTION_EN2ZH, OUTPUT_DIR, ASSERT_PREFIX,
+    ASSERTION_VOTE_PASSES,
 )
 from src.llm_client import batch_generate
 
@@ -86,46 +89,77 @@ def _to_zh_label(status: str) -> str:
     return ASSERTION_EN2ZH.get(status, "确定")
 
 
-def _build_prompt(entity: str, context: str, kg_knowledge: str) -> str:
+def _build_prompt(entity: str, context: str, kg_knowledge: str,
+                  variant: int = 0) -> str:
+    """
+    variant: 用于自洽投票时的轻微提示扰动。
+      0: 标准 prompt
+      1: 强调"先识别否定/疑似/科普语境，再确认存在"
+      2: 强调"先看 KG 关联疾病数量，再判断个体阳性"
+    """
     marked = _mark_entity(context, entity)
-    return USER_PROMPT_TEMPLATE.format(
-        marked_text=marked,
-        entity_name=entity,
+    base = USER_PROMPT_TEMPLATE.format(
+        marked_text=marked, entity_name=entity,
         kg_knowledge=kg_knowledge or "无关联知识",
     )
+    if variant == 1:
+        return base + "\n【判定顺序】先排查否定/询问/科普语境，确认非以上三者再选 Present。"
+    if variant == 2:
+        return base + "\n【判定顺序】先看 KG 是否给出多个关联疾病，若是且无具体患者主诉，倾向 General。"
+    return base
 
 
-def annotate(samples: List[Dict]) -> List[Dict]:
+def _kg_string(sample: Dict) -> str:
+    exp = sample.get("expansion") or {}
+    if not isinstance(exp, dict):
+        return "无关联知识"
+    ps = []
+    if exp.get("possible_diseases"):
+        ps.append(f"可能关联疾病:{','.join(exp['possible_diseases'][:5])}")
+    if exp.get("kg_facts"):
+        ps.append("事实:" + ";".join(exp["kg_facts"][:3]))
+    for k_zh, k in (("同义", "synonyms"), ("上位", "hypernyms"), ("相关", "related")):
+        if exp.get(k):
+            ps.append(f"{k_zh}:{','.join(exp[k][:3])}")
+    return " | ".join(ps) if ps else "无关联知识"
+
+
+def annotate(samples: List[Dict],
+             vote_passes: int = ASSERTION_VOTE_PASSES) -> List[Dict]:
+    """
+    vote_passes >= 2 时启用自洽投票：同一样本用不同 prompt 变体跑多次，多数票胜出。
+    """
     pending_idx = [i for i, s in enumerate(samples) if not s.get("label")]
-    print(f"  [Assertion] 待标注 {len(pending_idx)} / 总 {len(samples)}")
+    print(f"  [Assertion] 待标注 {len(pending_idx)} / 总 {len(samples)}  "
+          f"(vote_passes={vote_passes})")
+
     for bs in tqdm(range(0, len(pending_idx), ANNOT_BATCH), desc="annot"):
         idxs = pending_idx[bs: bs + ANNOT_BATCH]
-        prompts = []
+        votes: Dict[int, List[str]] = {i: [] for i in idxs}
+        raw_first: Dict[int, str] = {}
+
+        for v in range(max(1, vote_passes)):
+            prompts = []
+            for i in idxs:
+                s = samples[i]
+                kg_str = _kg_string(s)
+                prompts.append(_build_prompt(
+                    s["entity"], s.get("context", ""), kg_str, variant=v % 3))
+            prompts = [f"<<SYSTEM>>\n{SYSTEM_PROMPT}\n<<END>>\n{p}" for p in prompts]
+            resps = batch_generate(prompts, max_tokens=128, model_name="main")
+            for i, r in zip(idxs, resps):
+                votes[i].append(_parse_status(r))
+                if v == 0:
+                    raw_first[i] = r[:200]
+
+        # 多数票
         for i in idxs:
-            s = samples[i]
-            kg_str = ""
-            exp = s.get("expansion") or {}
-            if isinstance(exp, dict):
-                ps = []
-                # possible_diseases 放最前：对"知识事实"判别最有用
-                # （若实体能反查到多种关联疾病，则更可能是泛泛医学陈述）
-                if exp.get("possible_diseases"):
-                    ps.append(f"可能关联疾病:{','.join(exp['possible_diseases'][:5])}")
-                if exp.get("kg_facts"):
-                    ps.append("事实:" + ";".join(exp["kg_facts"][:3]))
-                for k_zh, k in (("同义", "synonyms"), ("上位", "hypernyms"), ("相关", "related")):
-                    if exp.get(k):
-                        ps.append(f"{k_zh}:{','.join(exp[k][:3])}")
-                kg_str = " | ".join(ps) if ps else "无关联知识"
-            prompts.append(_build_prompt(s["entity"], s.get("context", ""), kg_str))
-        # 加 system prompt
-        prompts = [f"<<SYSTEM>>\n{SYSTEM_PROMPT}\n<<END>>\n{p}" for p in prompts]
-        resps = batch_generate(prompts, max_tokens=128, model_name="main")
-        for i, r in zip(idxs, resps):
-            status_en = _parse_status(r)
+            cnt = Counter(votes[i])
+            status_en, _ = cnt.most_common(1)[0]
             samples[i]["label"]       = _to_zh_label(status_en)
             samples[i]["label_en"]    = status_en
-            samples[i]["llm_raw"]     = r[:200]
+            samples[i]["vote_dist"]   = dict(cnt)
+            samples[i]["llm_raw"]     = raw_first.get(i, "")
     return samples
 
 

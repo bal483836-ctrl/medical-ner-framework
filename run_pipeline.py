@@ -40,6 +40,7 @@ from src.data_processor import (
 from src.preanalysis import run_preanalysis, render_skills_block
 from src.reflector import reflect_cmeee, reflect_imcs, reflect_yidu
 from src.kg import load_kg
+from src.normalize_imcs import normalize_list as imcs_normalize_list
 
 
 def parse_args():
@@ -185,6 +186,26 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
 
         if args.step is None or args.step == 2:
             items = align_imcs_split(items, norm_vocab, p2)
+            # 6 级级联兜底：对仍未对齐的原词再走一次（提升归一化召回）
+            print("[Step2.3] 6 级归一化级联兜底…")
+            nv_set = set(norm_vocab or [])
+            for it in items:
+                norm_map = it.get("step2_normalized_map", {}) or {}
+                raw_ents = list(norm_map.keys()) or clean_entity_list(
+                    it.get("step1_raw_output", ""))
+                # 只对还映射到自身（未归一化）的实体走级联
+                unaligned = [e for e, n in norm_map.items() if e == n]
+                if not unaligned:
+                    continue
+                res = imcs_normalize_list(unaligned, nv_set)
+                for e, n in res["norm_map"].items():
+                    if n and n != e:
+                        norm_map[e] = n
+                it["step2_normalized_map"] = norm_map
+                # 重新生成 step2_norm_output
+                norm_set = list(dict.fromkeys(norm_map.values()))
+                it["step2_norm_output"] = ",".join(norm_set)
+            save_json(items, p2)
         else:
             tmp = load_existing(p2)
             if tmp: items = tmp

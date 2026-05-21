@@ -29,6 +29,7 @@ from config.config import (
     CLF_LEARNING_RATE, CLF_EPOCHS, CLF_WARMUP_RATIO,
     CLF_WEIGHT_DECAY, CLF_SEED, OUTPUT_DIR,
     CLF_FOCAL_GAMMA, CLF_FGM_EPS, CLF_HIDDEN_DROPOUT,
+    CLF_LABEL_SMOOTHING, CLF_RDROP_ALPHA,
 )
 
 
@@ -121,21 +122,50 @@ class _FGM:
 
 # ==================== Focal Loss ====================
 
-class _FocalLoss:
-    def __init__(self, alpha, gamma=CLF_FOCAL_GAMMA):
+class _FocalLossWithSmoothing:
+    """
+    Focal loss + label smoothing。
+    smoothing=0 时即标准 focal loss。
+    """
+    def __init__(self, alpha, gamma=CLF_FOCAL_GAMMA, smoothing=CLF_LABEL_SMOOTHING):
         import torch.nn.functional as F
         self.F = F
         self.alpha = alpha
         self.gamma = gamma
+        self.smoothing = smoothing
 
     def __call__(self, logits, targets):
         import torch
-        ce = self.F.cross_entropy(logits, targets, reduction="none")
+        n_cls = logits.size(-1)
+        log_probs = self.F.log_softmax(logits, dim=-1)
+
+        if self.smoothing > 0:
+            # 平滑后的 one-hot 分布
+            with torch.no_grad():
+                true_dist = torch.full_like(log_probs, self.smoothing / (n_cls - 1))
+                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+            ce = -(true_dist * log_probs).sum(dim=-1)
+        else:
+            ce = self.F.nll_loss(log_probs, targets, reduction="none")
+
         pt = torch.exp(-ce)
         loss = (1 - pt) ** self.gamma * ce
         if self.alpha is not None:
             loss = loss * self.alpha.gather(0, targets)
         return loss.mean()
+
+
+def _rdrop_kl(logits1, logits2):
+    """R-Drop 对称 KL：让同一输入两次 dropout 后的分布尽量一致。"""
+    import torch
+    import torch.nn.functional as F
+    lp1 = F.log_softmax(logits1, dim=-1)
+    lp2 = F.log_softmax(logits2, dim=-1)
+    p1  = F.softmax(logits1, dim=-1)
+    p2  = F.softmax(logits2, dim=-1)
+    kl_1 = F.kl_div(lp1, p2, reduction="batchmean")
+    kl_2 = F.kl_div(lp2, p1, reduction="batchmean")
+    return (kl_1 + kl_2) / 2
 
 
 # ==================== Dataset ====================
@@ -161,8 +191,21 @@ class _AssertionDataset:
 
 # ==================== 主训练 ====================
 
+def train_multi_seed(train_samples, dev_samples,
+                     seeds=(42, 2024, 7), base_dir=None) -> List[str]:
+    """训练多个种子的模型，返回各 final_dir 路径，供 eval 阶段做 logits 平均。"""
+    base_dir = base_dir or os.path.join(OUTPUT_DIR, "assertion_clf")
+    dirs = []
+    for s in seeds:
+        sub = os.path.join(base_dir, f"seed_{s}")
+        print(f"\n========== 训练 seed={s} → {sub} ==========")
+        dirs.append(train(train_samples, dev_samples, save_dir=sub, seed_override=s))
+    return dirs
+
+
 def train(train_samples: List[Dict], dev_samples: List[Dict],
-          save_dir: str = None) -> str:
+          save_dir: str = None,
+          seed_override: int = None) -> str:
     import torch
     import numpy as np
     from transformers import (
@@ -175,7 +218,7 @@ def train(train_samples: List[Dict], dev_samples: List[Dict],
 
     save_dir = save_dir or os.path.join(OUTPUT_DIR, "assertion_clf")
     os.makedirs(save_dir, exist_ok=True)
-    _set_seed()
+    _set_seed(seed_override if seed_override is not None else CLF_SEED)
 
     pool = train_samples + dev_samples
     tr_split, val_split = group_split(pool, val_ratio=0.1)
@@ -211,20 +254,36 @@ def train(train_samples: List[Dict], dev_samples: List[Dict],
     full_w = full_w / full_w.max()
     print(f"  [Train] class weights = {full_w.tolist()}")
     alpha_tensor = torch.tensor(full_w, dtype=torch.float)
-    focal = _FocalLoss(alpha=alpha_tensor, gamma=CLF_FOCAL_GAMMA)
+    focal = _FocalLossWithSmoothing(alpha=alpha_tensor,
+                                    gamma=CLF_FOCAL_GAMMA,
+                                    smoothing=CLF_LABEL_SMOOTHING)
 
     class AdversarialTrainer(Trainer):
+        """Focal + LabelSmoothing + R-Drop + FGM"""
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             self.alpha = alpha_tensor
 
+        def _focal(self, logits, labels):
+            self.alpha = self.alpha.to(logits.device)
+            focal.alpha = self.alpha
+            return focal(logits, labels)
+
         def compute_loss(self, model, inputs, return_outputs=False, **kw):
             labels = inputs.pop("labels")
             out = model(**inputs)
-            self.alpha = self.alpha.to(out.logits.device)
-            focal.alpha = self.alpha
-            loss = focal(out.logits, labels)
-            return (loss, out) if return_outputs else loss
+            loss = self._focal(out.logits, labels)
+            # R-Drop：再过一次（dropout 不同），加 KL 正则
+            if CLF_RDROP_ALPHA > 0 and model.training:
+                out2 = model(**inputs)
+                loss2 = self._focal(out2.logits, labels)
+                kl = _rdrop_kl(out.logits, out2.logits)
+                loss = 0.5 * (loss + loss2) + CLF_RDROP_ALPHA * kl
+            if return_outputs:
+                # 还原 labels 供下游
+                inputs["labels"] = labels
+                return loss, out
+            return loss
 
         def training_step(self, model, inputs, num_items_in_batch=None, **kw):
             model.train()
@@ -233,7 +292,7 @@ def train(train_samples: List[Dict], dev_samples: List[Dict],
                 loss = self.compute_loss(model, inputs)
             if self.args.n_gpu > 1: loss = loss.mean()
             self.accelerator.backward(loss, retain_graph=True)
-            # FGM 对抗
+            # FGM 对抗（在 embedding 上加扰动后再算一次）
             fgm = _FGM(model)
             fgm.attack(epsilon=CLF_FGM_EPS)
             with self.compute_loss_context_manager():
