@@ -45,12 +45,18 @@ def _set_seed(seed=CLF_SEED):
 # ==================== 文本拼装：query / context_text ====================
 
 def _kg_to_str(exp) -> str:
+    """把 expansion dict 压成 BERT query 用的扁平串。
+    possible_diseases 放前面，对"知识事实"类有强判别力。"""
     if not isinstance(exp, dict):
         return "无关联知识"
     parts = []
-    if exp.get("kg_facts"):  parts.append("事实:" + ";".join(exp["kg_facts"][:3]))
+    if exp.get("possible_diseases"):
+        parts.append(f"可能关联疾病:{','.join(exp['possible_diseases'][:5])}")
+    if exp.get("kg_facts"):
+        parts.append("事实:" + ";".join(exp["kg_facts"][:3]))
     for k_zh, k in (("同义", "synonyms"), ("上位", "hypernyms"), ("相关", "related")):
-        if exp.get(k): parts.append(f"{k_zh}:{','.join(exp[k][:3])}")
+        if exp.get(k):
+            parts.append(f"{k_zh}:{','.join(exp[k][:3])}")
     return " | ".join(parts) if parts else "无关联知识"
 
 

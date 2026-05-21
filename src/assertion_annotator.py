@@ -106,11 +106,16 @@ def annotate(samples: List[Dict]) -> List[Dict]:
             kg_str = ""
             exp = s.get("expansion") or {}
             if isinstance(exp, dict):
-                # 把 expansion 压成 KG 串
                 ps = []
-                if exp.get("kg_facts"): ps.append("事实:" + ";".join(exp["kg_facts"][:3]))
+                # possible_diseases 放最前：对"知识事实"判别最有用
+                # （若实体能反查到多种关联疾病，则更可能是泛泛医学陈述）
+                if exp.get("possible_diseases"):
+                    ps.append(f"可能关联疾病:{','.join(exp['possible_diseases'][:5])}")
+                if exp.get("kg_facts"):
+                    ps.append("事实:" + ";".join(exp["kg_facts"][:3]))
                 for k_zh, k in (("同义", "synonyms"), ("上位", "hypernyms"), ("相关", "related")):
-                    if exp.get(k): ps.append(f"{k_zh}:{','.join(exp[k][:3])}")
+                    if exp.get(k):
+                        ps.append(f"{k_zh}:{','.join(exp[k][:3])}")
                 kg_str = " | ".join(ps) if ps else "无关联知识"
             prompts.append(_build_prompt(s["entity"], s.get("context", ""), kg_str))
         # 加 system prompt
