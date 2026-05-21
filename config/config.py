@@ -126,12 +126,20 @@ CLF_SEED          = 42
 CLF_FOCAL_GAMMA   = 1.6
 CLF_FGM_EPS       = 0.11
 CLF_HIDDEN_DROPOUT = 0.15
+# v4.2 新增
+CLF_LABEL_SMOOTHING = 0.05          # 标签平滑
+CLF_RDROP_ALPHA     = 0.5           # R-Drop KL 权重；设 0 即关闭
+CLF_ENSEMBLE_SEEDS  = (42, 2024, 7) # 多种子集成（None 即单 seed）
 
 # ==================== 数据增强 ====================
-# 当某断言类别样本占比低于该阈值，触发增强
-AUG_MIN_CLASS_RATIO = 0.10
-# 增强倍数（每条少数类样本生成 N 条变体）
-AUG_MULTIPLIER      = 3
+AUG_MIN_CLASS_RATIO = 0.10   # 触发阈值
+AUG_MULTIPLIER      = 3      # 旧接口兼容
+# v4.2：按类目标补足，每类增强到 max_class * AUG_TARGET_RATIO
+AUG_TARGET_RATIO    = 0.85
+
+# ==================== 自洽投票 ====================
+# 同一样本多轮 LLM 标注取多数票，降低标注噪声（直接拉高分类器上限）
+ASSERTION_VOTE_PASSES = 3
 
 # ==================== 文件前缀 ====================
 STEP1_PREFIX   = "step1_raw_"

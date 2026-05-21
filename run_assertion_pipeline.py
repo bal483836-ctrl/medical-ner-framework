@@ -32,8 +32,9 @@ from src.kg import load_kg
 from src.context_window import context_from_text, context_from_dialogue
 from src.assertion_annotator import annotate, save as save_annotations
 from src.augmentor import augment, label_distribution
-from src.assertion_train import train as train_clf
+from src.assertion_train import train as train_clf, train_multi_seed
 from src.assertion_eval import evaluate
+from config.config import CLF_ENSEMBLE_SEEDS
 
 
 def _load(path):
@@ -116,6 +117,8 @@ def main():
     ap.add_argument("--skip-augment", action="store_true")
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--skip-eval", action="store_true")
+    ap.add_argument("--single-seed", action="store_true",
+                    help="只训单 seed（默认按 CLF_ENSEMBLE_SEEDS 训多 seed）")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -163,21 +166,36 @@ def main():
 
     # ----- 阶段 8: 小模型训练 (严格不用 test) -----
     if not args.skip_train:
-        model_dir = train_clf(
-            train_samples=samples_by_split["train"],
-            dev_samples=samples_by_split["dev"],
-        )
+        if args.single_seed or not CLF_ENSEMBLE_SEEDS:
+            model_dirs = [train_clf(
+                train_samples=samples_by_split["train"],
+                dev_samples=samples_by_split["dev"],
+            )]
+        else:
+            model_dirs = train_multi_seed(
+                train_samples=samples_by_split["train"],
+                dev_samples=samples_by_split["dev"],
+                seeds=CLF_ENSEMBLE_SEEDS,
+            )
     else:
-        model_dir = os.path.join(OUTPUT_DIR, "assertion_clf")
+        # 推断已有 seed 目录
+        base = os.path.join(OUTPUT_DIR, "assertion_clf")
+        candidates = []
+        if CLF_ENSEMBLE_SEEDS:
+            candidates = [os.path.join(base, f"seed_{s}", "final")
+                          for s in CLF_ENSEMBLE_SEEDS
+                          if os.path.exists(os.path.join(base, f"seed_{s}", "final"))]
+        model_dirs = candidates or [os.path.join(base, "final")]
 
-    # ----- 阶段 9: test 评估 -----
+    # ----- 阶段 9: test 评估（含验证集阈值搜索 + 集成）-----
     if not args.skip_eval and samples_by_split["test"]:
-        # test 必须有标签才能算 F1；若 LLM 标注被跳过且无 gold，无法评估
         labeled_test = [s for s in samples_by_split["test"] if s.get("label")]
         if not labeled_test:
             print("  ⚠️  test 无标注，无法评估 macro F1。")
         else:
-            evaluate(model_dir, labeled_test)
+            # 把 dev 当作阈值搜索集（test 完全独立）
+            val_for_bias = samples_by_split.get("dev", [])
+            evaluate(model_dirs, labeled_test, val_samples=val_for_bias)
 
     print(f"\n✅ 完成。总耗时 {(time.time()-t0)/60:.1f} 分钟")
 
