@@ -34,6 +34,7 @@ from src.assertion_annotator import annotate, save as save_annotations
 from src.augmentor import augment, label_distribution
 from src.assertion_train import train as train_clf, train_multi_seed
 from src.assertion_eval import evaluate
+from src.utils import set_global_seed, print_gpu_banner, stage_banner
 from config.config import CLF_ENSEMBLE_SEEDS
 
 
@@ -123,6 +124,8 @@ def main():
 
     t0 = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    set_global_seed()
+    print_gpu_banner()
     ds_tag = "CMeEE_V2" if args.dataset == "cmeee" else "IMCS_V2"
 
     print("\n[KG] 加载知识图谱…")

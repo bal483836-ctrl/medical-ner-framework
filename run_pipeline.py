@@ -41,6 +41,7 @@ from src.preanalysis import run_preanalysis, render_skills_block
 from src.reflector import reflect_cmeee, reflect_imcs, reflect_yidu
 from src.kg import load_kg
 from src.normalize_imcs import normalize_list as imcs_normalize_list
+from src.utils import set_global_seed, print_gpu_banner, stage_banner, kv_print
 
 
 def parse_args():
@@ -259,7 +260,9 @@ def main():
     args = parse_args()
     t0 = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"\n{'='*60}\n  🏥 医疗 NER 框架 v4\n{'='*60}")
+    print(f"\n{'='*70}\n  🏥 医疗 NER 框架 v4.2  (RTX 5090 优化)\n{'='*70}")
+    set_global_seed()
+    print_gpu_banner()
 
     # ----- 阶段 2 前置: 预学习 100 条 -----
     print("\n[Phase] 预学习 (per dataset, 100 samples)…")
