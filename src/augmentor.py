@@ -22,7 +22,7 @@ from config.config import (
 )
 from src.llm_client import batch_generate
 from src.assertion_annotator import annotate
-from src.utils import set_global_seed
+from src.utils import set_global_seed, atomic_save_json, load_checkpoint
 
 AUG_BATCH = 8
 
@@ -63,12 +63,16 @@ def _paraphrase_prompt(entity: str, context: str, label: str) -> str:
 
 def augment(samples: List[Dict],
             target_ratio: float = AUG_TARGET_RATIO,
-            max_aug_per_class: int = None) -> List[Dict]:
+            max_aug_per_class: int = None,
+            checkpoint_path: str = None) -> List[Dict]:
     """
-    把每个少数类增强到 max_count * target_ratio 条左右。
-    增强后做 LLM 二次断言确认。
+    每个少数类增强到 max_count * target_ratio 条左右 + LLM 二次断言确认。
+    checkpoint_path 不为 None 时：
+      - 增强生成阶段每 batch 落盘到 {checkpoint_path}.gen.json
+      - 二次确认阶段保存到 {checkpoint_path}.verify.json
+      - 重启时直接复用
     """
-    set_global_seed()   # 增强采样的可复现性
+    set_global_seed()
     counts = label_counts(samples)
     max_n = max(counts.values()) if counts else 0
     target_n = int(max_n * target_ratio)
@@ -92,15 +96,28 @@ def augment(samples: List[Dict],
     by_label = {lab: [s for s in samples if s.get("label") == lab]
                 for lab in ASSERTION_LABELS}
 
-    generated: List[Dict] = []
+    # ---- 改写阶段（断点：复用已生成 generated）----
+    gen_ckpt = (checkpoint_path + ".gen.json") if checkpoint_path else None
+    generated: List[Dict] = load_checkpoint(gen_ckpt) if gen_ckpt else None
+    if generated is None:
+        generated = []
+    else:
+        print(f"  [Resume] 复用增强候选 {len(generated)} 条")
+
+    # 按类已有数量
+    have_per_class = Counter(g["expected_label"] for g in generated)
+
+    batch_count = 0
     for lab, need in aug_jobs:
         pool = by_label[lab]
         if not pool:
             continue
-        # 候选数翻倍，预防二次确认丢弃
         target = need * 2
-        cursor = 0
-        for bs in tqdm(range(0, target, AUG_BATCH), desc=f"aug-{lab}"):
+        already = have_per_class.get(lab, 0)
+        if already >= target:
+            continue
+        cursor = already
+        for bs in tqdm(range(already, target, AUG_BATCH), desc=f"aug-{lab}"):
             batch_src = []
             for k in range(AUG_BATCH):
                 if cursor >= target:
@@ -123,10 +140,16 @@ def augment(samples: List[Dict],
                     "augmented": True,
                     "expected_label": src["label"],
                 })
+            batch_count += 1
+            if gen_ckpt and batch_count % 5 == 0:
+                atomic_save_json(generated, gen_ckpt)
+    if gen_ckpt:
+        atomic_save_json(generated, gen_ckpt)
 
-    # 二次确认（投票 1 次足够，提速）
+    # ---- 二次确认（断点由 annotator 内部接管）----
     print(f"  [Augment] 候选 {len(generated)} 条，做二次断言确认 ...")
-    confirmed = annotate(generated, vote_passes=1)
+    verify_ckpt = (checkpoint_path + ".verify.json") if checkpoint_path else None
+    confirmed = annotate(generated, vote_passes=1, output_path=verify_ckpt)
     kept = [g for g in confirmed if g.get("label") == g.get("expected_label")]
     drop = len(confirmed) - len(kept)
     print(f"  [Augment] 二次确认通过 {len(kept)} / 丢弃 {drop}")

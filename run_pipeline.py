@@ -122,7 +122,7 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
         # 反思（可选）
         if not args.no_reflect and (args.step is None or args.step == 2):
             print("[Step1.7] DeepSeek 反思校验…")
-            items = reflect_cmeee(items)
+            items = reflect_cmeee(items, output_path=p1e)
             # 反思结果反哺到 enriched_output（保持后续兼容）
             for it in items:
                 if it.get("reflected_output"):
@@ -179,7 +179,7 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
 
         if not args.no_reflect and (args.step is None or args.step == 2):
             print("[Step1.7] DeepSeek 反思校验…")
-            items = reflect_imcs(items)
+            items = reflect_imcs(items, output_path=p1)
             for it in items:
                 if it.get("reflected_output"):
                     it["step1_raw_output"] = it["reflected_output"]
@@ -243,7 +243,7 @@ def run_yidu(args, few_shot_str, kg):
         items = load_existing(p1) or []
     if items and not args.no_reflect:
         print("[Step1.7] DeepSeek 反思校验…")
-        items = reflect_yidu(items)
+        items = reflect_yidu(items, output_path=p1)
         for it in items:
             if it.get("reflected_output"):
                 it["step1_raw_output"] = it["reflected_output"]

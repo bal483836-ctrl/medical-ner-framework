@@ -6,6 +6,26 @@
 - **断言目标**：Macro F1 ≥ 0.90（4 类：确定 / 疑似 / 无 / 知识事实）
 - **严格防数据泄露**：test split 全程不参与训练；分类器按文档分组划分内部 val。
 
+## 断点续传矩阵（v4.2.2 全模块覆盖）
+
+| 阶段 | 模块 | 断点机制 | 保存频率 |
+|---|---|---|---|
+| Step1 抽取 | `extract_entities.py` | done_ids 集合 | 每 25 batch |
+| Step1.5 嵌套扩展 | `cmeee_expand.py` | 纯规则秒级，无需 | — |
+| Step1.7 反思 | `reflector.py` | `reflected_output` 字段标记 | 每 5 batch |
+| Step2 KG 对齐 | `kg_alignment.py` | 仅终态保存（无 LLM） | 完成时 |
+| Step2.3 6 级归一化 | `normalize_imcs.py` | 纯规则秒级，无需 | — |
+| Step2.5 KG 过滤 | `kg.py` | 内存计算，无需 | — |
+| Step3 幻觉过滤 | `filter_hallucinations.py` | `step3_final_output` 字段标记 | 每 20 条 |
+| Step4 评估 | `normalize_and_evaluate.py` | 一次性计算，无需 | — |
+| Stage 6 LLM 标注 | `assertion_annotator.py` | `label` 字段标记 | 每 10 batch |
+| Stage 7 增强 | `augmentor.py` | `.gen.json` + `.verify.json` 两阶段 | 每 5 batch |
+| Stage 8 训练 | `assertion_train.py` | HF Trainer `get_last_checkpoint` | 每 epoch |
+| Stage 9 评估 | `assertion_eval.py` | 一次性计算，无需 | — |
+
+**重启方式**：任何阶段中断，重新执行同一条命令即可自动续传，无需特殊参数。
+原子写入（`.tmp` → `rename`）保证 SIGKILL 也不损坏 JSON。
+
 ## v4.1 升级要点（吸取 v21 + 旧版断言代码精华）
 
 | 模块 | 升级 |

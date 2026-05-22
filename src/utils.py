@@ -107,3 +107,59 @@ def preview_items(items: list, n: int = 3, fields: tuple = None):
             print(f"      [{i}] {shown}")
         else:
             print(f"      [{i}] {str(it)[:200]}")
+
+
+# ==================== 通用断点续传 ====================
+
+import json as _json
+
+def atomic_save_json(data, path: str):
+    """先写 .tmp 再 rename，避免写一半被中断导致 JSON 损坏。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: str):
+    """加载已有断点；损坏自动跳过。"""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except (_json.JSONDecodeError, OSError) as e:
+        print(f"  ⚠️ 断点损坏 {path}: {e}，重新开始")
+        return None
+
+
+def resume_done_keys(path: str, key_field: str) -> set:
+    """从已有 checkpoint 读出已完成 key 集合。"""
+    data = load_checkpoint(path) or []
+    return {str(x.get(key_field, i)) for i, x in enumerate(data)}
+
+
+class PeriodicSaver:
+    """
+    每处理 every 条就 atomic save 一次。
+    用法：
+        saver = PeriodicSaver(out_path, every=50)
+        for x in items:
+            ...
+            saver.tick(results)   # results 是当前累积的 list
+        saver.finalize(results)
+    """
+    def __init__(self, path: str, every: int = 50):
+        self.path = path
+        self.every = max(1, every)
+        self.n = 0
+
+    def tick(self, results):
+        self.n += 1
+        if self.n % self.every == 0:
+            atomic_save_json(results, self.path)
+
+    def finalize(self, results):
+        atomic_save_json(results, self.path)
+        print(f"    💾 已保存 {len(results)} 条 → {self.path}")

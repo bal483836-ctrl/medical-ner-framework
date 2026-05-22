@@ -225,6 +225,7 @@ def filter_imcs_with_llm(
     items: List[Dict],
     output_path: str,
     anchor_threshold: float = 0.65,
+    save_every: int = 20,
 ) -> List[Dict]:
     """
     IMCS Step3：规则预过滤 + 大模型审核 + 原文锚定检查（修复版 v3.2）
@@ -242,7 +243,25 @@ def filter_imcs_with_llm(
       - 在最终输出时将口语词替换为标准词（提升字面 F1）
     """
     print(f"\n[Step3] IMCS 大模型过滤（原文锚定阈值: {anchor_threshold}）...")
+    # 断点恢复：复用已有结果的 step3_final_output
+    if output_path and os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if len(cached) == len(items):
+                for src, c in zip(items, cached):
+                    if c.get("step3_final_output") is not None and not src.get("step3_final_output"):
+                        src["step3_final_output"] = c["step3_final_output"]
+                done = sum(1 for it in items if it.get("step3_final_output") is not None)
+                print(f"  [Resume] IMCS Step3 已完成 {done}/{len(items)}")
+        except Exception as e:
+            print(f"  ⚠️ 断点损坏: {e}")
+
+    processed = 0
     for item in items:
+        # 已完成则跳过
+        if item.get("step3_final_output") is not None:
+            continue
         # 关键修复：用 step2_aligned_output（原词）做锚定，而不是 step2_norm_output
         candidates = clean_entity_list(
             item.get("step2_aligned_output", item.get("step1_raw_output", ""))
@@ -326,6 +345,9 @@ def filter_imcs_with_llm(
                 normalized_ents.append(norm_ent)
 
         item["step3_final_output"] = ",".join(normalized_ents)
+        processed += 1
+        if save_every and processed % save_every == 0:
+            _save_json(items, output_path)
 
     _save_json(items, output_path)
     print(f"  ✅ IMCS Step3 保存至: {output_path}")

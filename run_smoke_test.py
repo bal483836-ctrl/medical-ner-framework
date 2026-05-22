@@ -126,7 +126,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
             preview_items(items, n=2, fields=("step1_enriched_output", "gold_entities_str"))
 
             print("\n  ▶ Step1.7: DeepSeek 反思")
-            items = reflect_cmeee(items)
+            items = reflect_cmeee(items, output_path=p1e)
             for it in items:
                 if it.get("reflected_output"):
                     it["step1_enriched_output"] = it["reflected_output"]
@@ -171,7 +171,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
             preview_items(items, n=2, fields=("dialogue_id", "step1_raw_output", "gold_entities_str"))
 
             print("\n  ▶ Step1.7: DeepSeek 反思")
-            items = reflect_imcs(items)
+            items = reflect_imcs(items, output_path=p1)
             for it in items:
                 if it.get("reflected_output"):
                     it["step1_raw_output"] = it["reflected_output"]
@@ -287,7 +287,8 @@ def run_assertion_smoke(dataset_tag: str, n: int,
     stage_banner(f"阶段 6 [{ds}]", "LLM 自洽投票断言标注（vote=3）")
     for split in ("train", "dev", "test"):
         if not samples_by_split[split]: continue
-        samples_by_split[split] = annotate(samples_by_split[split], vote_passes=3)
+        anno_path = os.path.join(OUTPUT_DIR, f"smoke_{ASSERT_PREFIX}{ds}_{split}.json")
+        samples_by_split[split] = annotate(samples_by_split[split], vote_passes=3, output_path=anno_path)
         path = os.path.join(OUTPUT_DIR, f"smoke_{ASSERT_PREFIX}{ds}_{split}.json")
         save_anno(samples_by_split[split], ds, split,
                   out_dir=OUTPUT_DIR)
@@ -298,7 +299,8 @@ def run_assertion_smoke(dataset_tag: str, n: int,
     stage_banner(f"阶段 7 [{ds}]", "分布检测 + 按类目标补足增强")
     merged = samples_by_split["train"] + samples_by_split["dev"]
     print(f"  增强前: {label_distribution(merged)}")
-    aug = augment(merged)
+    aug_ckpt = os.path.join(OUTPUT_DIR, f"smoke_{ASSERT_PREFIX}{ds}_aug_ckpt")
+    aug = augment(merged, checkpoint_path=aug_ckpt)
     print(f"  增强后: {label_distribution(aug)}")
     n_train = len(samples_by_split["train"])
     samples_by_split["train"] = aug[:n_train] + aug[len(merged):]

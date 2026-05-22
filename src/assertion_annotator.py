@@ -13,7 +13,7 @@ import os
 import re
 import sys
 from collections import Counter
-from typing import Dict, List
+from typing import Dict, List, Optional
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,8 +22,10 @@ from config.config import (
     ASSERTION_VOTE_PASSES,
 )
 from src.llm_client import batch_generate
+from src.utils import atomic_save_json, load_checkpoint
 
 ANNOT_BATCH = 8
+SAVE_EVERY_BATCHES = 10
 
 SYSTEM_PROMPT = "你是一个严谨的临床医学信息提取专家。你的核心任务是对医学文本中的实体进行状态断言分类。"
 
@@ -125,14 +127,32 @@ def _kg_string(sample: Dict) -> str:
 
 
 def annotate(samples: List[Dict],
-             vote_passes: int = ASSERTION_VOTE_PASSES) -> List[Dict]:
+             vote_passes: int = ASSERTION_VOTE_PASSES,
+             output_path: Optional[str] = None) -> List[Dict]:
     """
-    vote_passes >= 2 时启用自洽投票：同一样本用不同 prompt 变体跑多次，多数票胜出。
+    自洽投票多数票。
+    output_path 不为 None 时启用断点续传：
+      - 启动时若 output_path 存在且条数匹配，复用其中已有 label
+      - 每 SAVE_EVERY_BATCHES 个 batch 落盘一次
     """
+    # 断点恢复
+    if output_path:
+        existing = load_checkpoint(output_path)
+        if existing and len(existing) == len(samples):
+            for src, cached in zip(samples, existing):
+                if cached.get("label") and not src.get("label"):
+                    src["label"]      = cached["label"]
+                    src["label_en"]   = cached.get("label_en", "")
+                    src["vote_dist"]  = cached.get("vote_dist", {})
+                    src["llm_raw"]    = cached.get("llm_raw", "")
+            n_done = sum(1 for s in samples if s.get("label"))
+            print(f"  [Resume] annotator 已完成 {n_done}/{len(samples)}")
+
     pending_idx = [i for i, s in enumerate(samples) if not s.get("label")]
     print(f"  [Assertion] 待标注 {len(pending_idx)} / 总 {len(samples)}  "
           f"(vote_passes={vote_passes})")
 
+    batch_count = 0
     for bs in tqdm(range(0, len(pending_idx), ANNOT_BATCH), desc="annot"):
         idxs = pending_idx[bs: bs + ANNOT_BATCH]
         votes: Dict[int, List[str]] = {i: [] for i in idxs}
@@ -160,6 +180,13 @@ def annotate(samples: List[Dict],
             samples[i]["label_en"]    = status_en
             samples[i]["vote_dist"]   = dict(cnt)
             samples[i]["llm_raw"]     = raw_first.get(i, "")
+
+        batch_count += 1
+        if output_path and batch_count % SAVE_EVERY_BATCHES == 0:
+            atomic_save_json(samples, output_path)
+
+    if output_path:
+        atomic_save_json(samples, output_path)
     return samples
 
 

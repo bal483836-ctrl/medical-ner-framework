@@ -152,14 +152,15 @@ def main():
                 k = key(s)
                 if k in seen:
                     s["label"] = seen[k]["label"]
-        samples_by_split[split] = annotate(samples_by_split[split])
+        samples_by_split[split] = annotate(samples_by_split[split], output_path=path)
         save_annotations(samples_by_split[split], ds_tag, split)
 
     # ----- 阶段 7: 分布检测 + 增强（只对 train+dev）-----
     if not args.skip_augment:
         merged_tr = samples_by_split["train"] + samples_by_split["dev"]
         print(f"\n[Augment] 增强前分布: {label_distribution(merged_tr)}")
-        augmented = augment(merged_tr)
+        aug_ckpt = os.path.join(OUTPUT_DIR, f"{ASSERT_PREFIX}{ds_tag}_aug_ckpt")
+        augmented = augment(merged_tr, checkpoint_path=aug_ckpt)
         print(f"[Augment] 增强后分布: {label_distribution(augmented)}")
         # 把增强后的样本拆回 train（增强样本归到 train）
         n_tr = len(samples_by_split["train"])

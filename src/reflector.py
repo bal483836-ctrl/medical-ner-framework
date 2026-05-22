@@ -1,21 +1,21 @@
 """
-DeepSeek CoT 反思（NER Step 1.7）— v4.1
-吸取 v21 unified_prompt 的 <thinking>...</thinking><answer>...</answer> 格式
-
-策略：让反思模型先在 <thinking> 里逐项分析，再在 <answer> 里输出最终实体列表。
+DeepSeek CoT 反思（NER Step 1.7）— v4.2.2
+增加断点续传：传入 output_path 时，每 5 个 batch 落盘一次。
+重启后通过 reflected_output 字段是否存在跳过已完成 item。
 """
-import json
 import os
 import re
 import sys
-from typing import List, Dict
+from typing import List, Dict, Optional
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.llm_client import batch_generate
 from src.data_processor import clean_entity_list
+from src.utils import atomic_save_json, load_checkpoint
 
 REFLECT_BATCH = 8
+SAVE_EVERY_BATCHES = 5
 
 
 def _cot_prompt(text: str, entities: List[str], domain_hint: str) -> str:
@@ -45,7 +45,6 @@ def _cot_prompt(text: str, entities: List[str], domain_hint: str) -> str:
 
 
 def _parse_answer(text: str) -> List[str]:
-    """从 <answer>...</answer> 中提取实体；缺失时正则兜底。"""
     if not text:
         return []
     text = re.sub(r"```[a-z]*|```", "", text)
@@ -56,9 +55,27 @@ def _parse_answer(text: str) -> List[str]:
 
 
 def reflect_batch(items: List[Dict], text_field: str,
-                  in_field: str, out_field: str, domain_hint: str) -> List[Dict]:
+                  in_field: str, out_field: str, domain_hint: str,
+                  output_path: Optional[str] = None) -> List[Dict]:
+    """
+    支持断点续传：output_path 不为 None 时，
+      - 启动先加载已存在的同名文件，把 out_field 已填的 item 标记为完成
+      - 每 SAVE_EVERY_BATCHES 个 batch 落盘一次
+    """
+    # 断点恢复：合并已有结果
+    if output_path:
+        existing = load_checkpoint(output_path)
+        if existing and len(existing) == len(items):
+            for src, cached in zip(items, existing):
+                if cached.get(out_field) and not src.get(out_field):
+                    src[out_field] = cached[out_field]
+            done = sum(1 for it in items if it.get(out_field) is not None)
+            print(f"  [Resume] reflector 已完成 {done}/{len(items)}")
+
     pending = []
     for idx, it in enumerate(items):
+        if it.get(out_field) is not None:
+            continue   # 已经反思过，跳过
         ents = clean_entity_list(it.get(in_field, ""))
         text = it.get(text_field, "")
         if not text:
@@ -66,27 +83,34 @@ def reflect_batch(items: List[Dict], text_field: str,
             continue
         pending.append((idx, text, ents))
 
+    batch_count = 0
     for bs in tqdm(range(0, len(pending), REFLECT_BATCH), desc="reflect"):
         batch = pending[bs:bs + REFLECT_BATCH]
         prompts = [_cot_prompt(t, e, domain_hint) for _, t, e in batch]
         resps = batch_generate(prompts, max_tokens=512, model_name="reflect")
         for (idx, text, _), r in zip(batch, resps):
             ents = _parse_answer(r)
-            # 锚定回原文，防幻觉
             anchored = [e for e in ents if e in text]
             items[idx][out_field] = ",".join(dict.fromkeys(anchored))
+        batch_count += 1
+        if output_path and batch_count % SAVE_EVERY_BATCHES == 0:
+            atomic_save_json(items, output_path)
+
+    if output_path:
+        atomic_save_json(items, output_path)
     return items
 
 
-def reflect_cmeee(items):
+def reflect_cmeee(items, output_path=None):
     return reflect_batch(
         items, text_field="text",
         in_field="step1_enriched_output", out_field="reflected_output",
         domain_hint="数据集为 CMeEE_V2，9 类实体（dis/sym/pro/equ/dru/ite/bod/mic/dep）。",
+        output_path=output_path,
     )
 
 
-def reflect_imcs(items):
+def reflect_imcs(items, output_path=None):
     for it in items:
         it["_full_text"] = (it.get("self_report") or "") + " " + " ".join(
             t.get("sentence", "") for t in it.get("dialogue", []))
@@ -94,15 +118,17 @@ def reflect_imcs(items):
         items, text_field="_full_text",
         in_field="step1_raw_output", out_field="reflected_output",
         domain_hint="数据集为 IMCS_V2 儿科对话，抽原文症状形态，不归一化。",
+        output_path=output_path,
     )
     for it in res:
         it.pop("_full_text", None)
     return res
 
 
-def reflect_yidu(items):
+def reflect_yidu(items, output_path=None):
     return reflect_batch(
         items, text_field="text",
         in_field="step1_raw_output", out_field="reflected_output",
         domain_hint="数据集为电子病历，关注疾病/影像/检验/药物/解剖/手术 6 类。",
+        output_path=output_path,
     )
