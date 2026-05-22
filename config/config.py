@@ -121,6 +121,7 @@ CONTEXT_DIALOGUE_TURNS = 2
 # ==================== 评估目标 ====================
 F1_TARGET_NER       = 0.80
 F1_TARGET_ASSERTION = 0.90
+F1_TARGET           = F1_TARGET_NER   # 向后兼容旧模块
 DUAL_F1_EVAL        = True
 
 # ==================== 分类器训练超参（吸取 Optuna 黄金参数）====================
