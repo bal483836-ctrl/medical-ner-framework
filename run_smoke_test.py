@@ -135,11 +135,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
             print("\n  ▶ Step2: KG 对齐")
             items = align_cmeee_split(items, cmeee_vocab, p2)
 
-            print("\n  ▶ Step2.5: KG 余弦过滤 ≥ 0.80")
-            for it in items:
-                ents = clean_entity_list(it.get("step2_aligned_output", ""))
-                kept = kg.filter_by_similarity(ents, threshold=0.80)
-                it["step2_aligned_output"] = ",".join(kept)
+            print("\n  ▶ Step2.5: 跳过 KG 过滤（v4.3 passthrough，避免误删合法实体）")
             _save(items, p2)
             preview_items(items, n=2, fields=("step2_aligned_output",))
 
@@ -195,11 +191,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
                 it["step2_norm_output"] = ",".join(dict.fromkeys(nm.values()))
             print(f"    级联补救成功 {n_added} 个原词")
 
-            print("\n  ▶ Step2.5: KG 过滤（IMCS 标准词跳过）")
-            for it in items:
-                ents = clean_entity_list(it.get("step2_aligned_output", ""))
-                kept = kg.filter_by_similarity(ents, threshold=0.80, skip_normalized=True)
-                it["step2_aligned_output"] = ",".join(kept)
+            print("\n  ▶ Step2.5: 跳过 KG 过滤（IMCS 走 Step2 + Step2.3 归一化级联即可）")
             _save(items, p2)
 
             print("\n  ▶ Step3: LLM 幻觉过滤")

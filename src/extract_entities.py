@@ -41,27 +41,26 @@ IMCS_TURN_BATCH_SIZE = LLM_BATCH_SIZE_IMCS    # 5090: 24
 # ==================== Prompt 构建（精简版）====================
 
 def build_cmeee_prompt(text: str, few_shot_str: str) -> str:
-    """
-    CMeEE / yidu 医学文本实体抽取 Prompt（精简版）
-    相比 v3.1 减少约 40% token，核心规则保留，速度更快
-    """
+    """CMeEE prompt (v4.3 强化版)：明确边界规则、强制单字、去后缀"""
     types = "、".join([f"{v}({k})" for k, v in CMEEE_TYPE_MAP.items()])
-    return f"""医学NER任务。从文本中提取所有医疗命名实体，原文原样输出，用逗号分隔。
+    return f"""医学 NER 任务。从文本抽医疗实体，原文逐字符复制，逗号分隔。
 
 实体类型：{types}
 
-规则：
-①原文原样复制，禁止归一化或改写
-②单字身体部位必须提取（脑/肝/肺/肾/心/胃/肠/脾/骨/血/皮/眼/耳/鼻/腹/胸等）
-③嵌套实体全部提取（"胃酸分泌"同时提取"胃酸"；"脑细胞"同时提取"脑"）
-④短词专业术语保留（三凹/鼻扇/环切/缺氧/水肿/坏死/梗死/栓塞等）
-⑤禁止提取：性别年龄/时间数字/方位词/连词/纯化学基团
+⚠️ CMeEE 标注边界规则（必须严格遵守）：
+① 单字身体部位独立抽（脑/心/肝/肺/肾/胃/肠/血/尿/胸/腹/头/眼/耳/口/手/脚/骨/皮/喉/腰/鼻/舌/齿）
+② 去后缀：「头痛」抽「头」，「瞳孔变化」抽「瞳孔」，「肌张力增高」抽「肌张力」
+③ 顿号/括号连接的并列短语保持原样：「水、盐电解质紊乱」整体抽
+④ 嵌套都抽：「葡萄球菌肺炎」+「葡萄球菌」
+⑤ 禁止抽：HTML 标签（<sub>等）、性别年龄、时间数字、带百分号或单位的长描述
+⑥ 边界精确：不带前缀「治疗/明显的」，不带尾部「了/的/吗/啊」
 
 示例：
 {few_shot_str}
 
 文本：{text}
-实体："""
+
+实体（逗号分隔，严格按上述规则）："""
 
 
 def build_imcs_turn_prompt(
@@ -95,18 +94,46 @@ def build_imcs_turn_prompt(
 
 # ==================== 后处理工具 ====================
 
+_BODY_SINGLE_CHARS = set("脑心肝肺肾胃肠脾血尿胸腹头眼耳口舌齿喉腰骨皮足手鼻")
+_DROP_SUFFIXES = ["痛", "变化", "增高", "降低", "紊乱", "异常", "障碍", "反应", "状态"]
+
+
 def _postprocess_cmeee(entity_names: List[str], text: str) -> List[Dict]:
-    """CMeEE 实体后处理：去噪、原文锚定、去重"""
+    """CMeEE 后处理 v4.3：去 HTML / 去后缀缩边界 / 单字 force recall / 原文锚定 / 去重"""
+    candidates = list(entity_names)
+    # 单字身体部位 force recall：原文出现即加
+    for ch in _BODY_SINGLE_CHARS:
+        if ch in text and ch not in candidates:
+            candidates.append(ch)
     entities, seen = [], set()
-    for name in entity_names:
+    for name in candidates:
+        if not name:
+            continue
+        # 去 HTML 标签（<sub> 等）
+        name = re.sub(r"<[^>]+>", "", name).strip()
+        # 去尾部助词
         name = re.sub(r"[的等了吗啊呢吧哦嗯]+$", "", name).strip()
+        # 尝试后缀缩到 CMeEE 标注边界（如「头痛」→「头」）
+        for suf in _DROP_SUFFIXES:
+            if len(name) > len(suf) and name.endswith(suf):
+                short = name[:-len(suf)]
+                if short in text and short not in seen:
+                    seen.add(short)
+                    s = text.find(short)
+                    entities.append({"start_idx": s, "end_idx": s + len(short), "entity": short})
+                break
+        # 噪声过滤
         if not name or re.match(r"^[\d\s\W]+$", name) or name in seen:
+            continue
+        if "%" in name and len(name) > 6:
+            continue
+        if "～" in name or " kPa" in name:
             continue
         if name not in text:
             continue
         seen.add(name)
-        start = text.find(name)
-        entities.append({"start_idx": start, "end_idx": start + len(name), "entity": name})
+        s = text.find(name)
+        entities.append({"start_idx": s, "end_idx": s + len(name), "entity": name})
     return entities
 
 

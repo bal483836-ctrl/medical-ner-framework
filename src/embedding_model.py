@@ -21,6 +21,14 @@ _embed_tokenizer = None
 
 
 def get_embedding_model():
+    # v4.3: 加载 BGE 前释放 LLM 显存
+    try:
+        from src.llm_client import release_llm
+        import torch, gc
+        release_llm()
+        torch.cuda.empty_cache(); gc.collect()
+    except Exception:
+        pass
     """懒加载向量模型"""
     global _embed_model, _embed_tokenizer
     if _embed_model is not None:
@@ -174,13 +182,20 @@ def find_best_matches(
 
 
 def release_embedding_model():
-    """释放向量模型显存"""
+    """v4.3 加强：把模型搬 CPU 再 del，真正回收显存"""
     global _embed_model, _embed_tokenizer
     if _embed_model is not None:
         import torch
+        try:
+            if hasattr(_embed_model, "cpu"):
+                _embed_model.cpu()
+        except Exception:
+            pass
         del _embed_model
         _embed_model = None
         _embed_tokenizer = None
-        torch.cuda.empty_cache()
         gc.collect()
-        print("[Embed] 已释放显存")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        print("  [Embed] 已释放显存")

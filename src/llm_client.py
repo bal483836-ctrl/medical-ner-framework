@@ -23,6 +23,14 @@ _INSTANCES = {}   # name -> (model, tokenizer)
 
 
 def _load(path: str):
+    # v4.3: 加载 LLM 前释放 BGE 显存，避免 offload-to-meta OOM
+    try:
+        from src.embedding_model import release_embedding_model
+        import torch, gc
+        release_embedding_model()
+        torch.cuda.empty_cache(); gc.collect()
+    except Exception as _e:
+        pass
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -165,12 +173,19 @@ def clean_llm_output(text: str) -> str:
 
 
 def release_llm(name: str = None):
+    """v4.3 加强：先把模型搬到 CPU 再 del，确保 cuda allocator 能真的回收。"""
     import torch
-    if name is None:
-        keys = list(_INSTANCES.keys())
-    else:
-        keys = [name] if name in _INSTANCES else []
+    keys = list(_INSTANCES.keys()) if name is None else ([name] if name in _INSTANCES else [])
     for k in keys:
-        del _INSTANCES[k]
-    torch.cuda.empty_cache()
+        model, tok = _INSTANCES.pop(k)
+        try:
+            model.cpu()
+        except Exception:
+            pass
+        del model, tok
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    if keys:
+        print(f"  [LLM] 释放显存：{keys}")

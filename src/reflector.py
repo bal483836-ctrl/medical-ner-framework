@@ -1,13 +1,15 @@
 """
-DeepSeek CoT 反思（NER Step 1.7）— v4.2.2
-增加断点续传：传入 output_path 时，每 5 个 batch 落盘一次。
-重启后通过 reflected_output 字段是否存在跳过已完成 item。
+DeepSeek CoT 反思（NER Step 1.7）— v4.3
+断点续传：每 5 batch 落盘。
+v4.3：通过 MNER_DISABLE_REFLECT=1 可整体跳过反思（显存压力 / DeepSeek-AWQ 兼容性问题）
 """
 import os
 import re
 import sys
 from typing import List, Dict, Optional
 from tqdm import tqdm
+
+DISABLE_REFLECT = os.environ.get("MNER_DISABLE_REFLECT", "0") in ("1", "true", "True")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.llm_client import batch_generate
@@ -101,7 +103,13 @@ def reflect_batch(items: List[Dict], text_field: str,
     return items
 
 
+def _skip_reflect(items):
+    print("  [Skip] 反思已禁用 (MNER_DISABLE_REFLECT=1)")
+    return items
+
+
 def reflect_cmeee(items, output_path=None):
+    if DISABLE_REFLECT: return _skip_reflect(items)
     return reflect_batch(
         items, text_field="text",
         in_field="step1_enriched_output", out_field="reflected_output",
@@ -111,6 +119,7 @@ def reflect_cmeee(items, output_path=None):
 
 
 def reflect_imcs(items, output_path=None):
+    if DISABLE_REFLECT: return _skip_reflect(items)
     for it in items:
         it["_full_text"] = (it.get("self_report") or "") + " " + " ".join(
             t.get("sentence", "") for t in it.get("dialogue", []))
@@ -126,6 +135,7 @@ def reflect_imcs(items, output_path=None):
 
 
 def reflect_yidu(items, output_path=None):
+    if DISABLE_REFLECT: return _skip_reflect(items)
     return reflect_batch(
         items, text_field="text",
         in_field="step1_raw_output", out_field="reflected_output",
