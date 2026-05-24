@@ -316,6 +316,18 @@ def load_kg() -> KnowledgeGraph:
         except Exception as e:
             print(f"  [KG] 降级失败: {e}")
 
+    # v4.3: 合并训练集 gold 词表，防止 train 见过的实体被 KG 过滤误删
+    try:
+        from src.data_processor import load_cmeee, build_cmeee_entity_vocab
+        added = 0
+        for w in build_cmeee_entity_vocab(load_cmeee("train")):
+            if w not in nodes:
+                nodes.add(w); added += 1
+        if added:
+            print(f"  [KG] 合并 CMeEE train 词表 +{added}")
+    except Exception as e:
+        print(f"  [KG] 合并训练词表跳过: {e}")
+
     src = " + ".join(source_parts) if source_parts else "empty"
     _SINGLETON = KnowledgeGraph(nodes, rels,
                                 inverse_relations=inv_rels, source=src)
