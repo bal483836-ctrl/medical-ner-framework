@@ -56,6 +56,19 @@ def _load(path: str):
 
     _validate_local_model_path(path)
 
+    # 检测是否为已量化模型（AWQ / GPTQ），它们 config.json 内自带 quantization_config，
+    # 不能再叠加 bnb 4bit，也不应手动指定 dtype。
+    import json
+    try:
+        with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as _f:
+            _cfg = json.load(_f)
+        _has_quant = "quantization_config" in _cfg
+    except Exception:
+        _has_quant = False
+    _is_prequantized = _has_quant or any(
+        k in os.path.basename(path).upper() for k in ("AWQ", "GPTQ")
+    )
+
     tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -63,18 +76,21 @@ def _load(path: str):
     kwargs = {
         "trust_remote_code": True,
         "device_map": LLM_DEVICE_MAP,
-        "dtype": torch.bfloat16,
         "attn_implementation": "flash_attention_2" if LLM_USE_FLASH_ATTN else "sdpa",
     }
-    if LLM_USE_4BIT:
-        from transformers import BitsAndBytesConfig
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        kwargs.pop("dtype", None)
+    if _is_prequantized:
+        print(f"[LLM] 检测到预量化模型（AWQ/GPTQ），跳过 bnb 4bit、不指定 dtype")
+    else:
+        kwargs["dtype"] = torch.bfloat16
+        if LLM_USE_4BIT:
+            from transformers import BitsAndBytesConfig
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            kwargs.pop("dtype", None)
 
     model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
     model.eval()

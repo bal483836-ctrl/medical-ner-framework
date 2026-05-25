@@ -46,8 +46,11 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 # ==================== 本地模型路径 ====================
 MODEL_ROOT = os.environ.get("MNER_MODEL_ROOT", "/root/autodl-tmp/MedNER_Project/models")
 
-# 主抽取与断言模型：Qwen3-32B
-LLM_MODEL_PATH      = os.path.join(MODEL_ROOT, "Qwen3-32B")
+# 主抽取与断言模型：Qwen3-32B（默认走 AWQ 量化版，可用 MNER_LLM_PATH 覆盖）
+LLM_MODEL_PATH      = os.environ.get(
+    "MNER_LLM_PATH",
+    os.path.join(MODEL_ROOT, "Qwen3-32B-AWQ"),
+)
 # 反思模型：DeepSeek（用户可改路径）
 REFLECT_MODEL_PATH  = os.path.join(MODEL_ROOT, "DeepSeek-V2-Lite-Chat")
 # 向量模型
