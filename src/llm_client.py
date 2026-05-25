@@ -20,6 +20,23 @@ from config.config import (
 )
 
 _INSTANCES = {}   # name -> (model, tokenizer)
+_LOAD_FAILED = {}  # name -> Exception，避免每个 batch 重复尝试加载失败模型
+
+
+def _validate_local_model_path(path: str):
+    """LLM 路径必须是本地已存在、含 config.json 的目录，否则给出明确报错。"""
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"[LLM] 模型目录不存在: {path}\n"
+            f"  → 请确认已下载模型到该路径，或通过环境变量 MNER_MODEL_ROOT 指定父目录。\n"
+            f"  → HuggingFace 把不存在的本地路径当作 repo_id 校验，因而报 "
+            f"'Repo id must be in the form ...' 的迷惑性错误。"
+        )
+    if not os.path.exists(os.path.join(path, "config.json")):
+        raise FileNotFoundError(
+            f"[LLM] 目录存在但缺少 config.json: {path}\n"
+            f"  → 目录内容: {sorted(os.listdir(path))[:20]}"
+        )
 
 
 def _load(path: str):
@@ -36,6 +53,8 @@ def _load(path: str):
 
     print(f"\n[LLM] 加载 {path}")
     print(f"[LLM] 4bit={LLM_USE_4BIT}  FlashAttn={LLM_USE_FLASH_ATTN}")
+
+    _validate_local_model_path(path)
 
     tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
     if tok.pad_token is None:
@@ -66,8 +85,14 @@ def _load(path: str):
 def get_llm(name: str = "main"):
     if name in _INSTANCES:
         return _INSTANCES[name]
+    if name in _LOAD_FAILED:
+        raise _LOAD_FAILED[name]
     path = LLM_MODEL_PATH if name == "main" else REFLECT_MODEL_PATH
-    _INSTANCES[name] = _load(path)
+    try:
+        _INSTANCES[name] = _load(path)
+    except Exception as e:
+        _LOAD_FAILED[name] = e
+        raise
     return _INSTANCES[name]
 
 
@@ -81,9 +106,11 @@ def batch_generate(
     import torch
     max_tokens = max_tokens or LLM_MAX_NEW_TOKENS
 
+    # 加载失败属于配置错误，不应反复重试。先尝试加载一次，失败直接抛出。
+    model, tokenizer = get_llm(model_name)
+
     for attempt in range(retries):
         try:
-            model, tokenizer = get_llm(model_name)
             texts = []
             for p in prompts:
                 msgs = [{"role": "user", "content": p}]
