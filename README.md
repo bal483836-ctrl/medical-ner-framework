@@ -6,6 +6,56 @@
 - **断言目标**：Macro F1 ≥ 0.90（4 类：确定 / 疑似 / 无 / 知识事实）
 - **严格防数据泄露**：test split 全程不参与训练；分类器按文档分组划分内部 val。
 
+## 统一断言流水线（v4.4 新增）
+
+`run_unified_assertion.py` — 三数据集合并训练，分别在 test 集评估 macro F1。
+
+```
+Stage 5-6 (per dataset)：
+    NER step3 → 构建 (实体, 语境, KG扩展) 样本 → LLM 自洽投票标注
+    每个样本打 dataset 标签 (CMeEE_V2 / IMCS_V2 / yidu_4k)
+
+Stage 7 (merged)：
+    train_all = CMeEE.train ∪ IMCS.train ∪ yidu.train
+    dev_all   = CMeEE.dev   ∪ IMCS.dev   ∪ yidu.dev
+    分布检测 + 按类目标补足增强（仅作用于 train_all）
+
+Stage 8 (merged)：
+    在 train_all + dev_all 上训练 1 个统一 RoBERTa 分类器
+    按 dataset::doc_id group split 防泄露
+
+Stage 9 (per dataset)：
+    CMeEE.test / IMCS.test / yidu.test 分别评估 → 3 个独立 macro F1
+    阈值搜索只用 dev_all
+```
+
+运行：
+
+```bash
+# 默认（多 seed + 自洽投票）
+python run_unified_assertion.py
+
+# 跳过 LLM 标注（复用 outputs/assertion_*.json）
+python run_unified_assertion.py --skip-annotate
+
+# 已有训练好的模型，只评估
+python run_unified_assertion.py --skip-train
+
+# 单 seed 提速
+python run_unified_assertion.py --single-seed
+
+# 限制规模（开发时）
+python run_unified_assertion.py --limit-train-per-ds 200 --limit-test-per-ds 100
+```
+
+产物：
+- `outputs/assertion_{CMeEE_V2,IMCS_V2,yidu_4k}_{train,dev,test}.json`  per-split LLM 标注
+- `outputs/assertion_UNIFIED_train.json` / `assertion_UNIFIED_dev.json`  合并后的训练/验证集
+- `outputs/unified_assertion_clf/seed_{42,2024,7}/final/`  3 个 seed 的模型
+- `outputs/unified_assertion_report.json`  含三个 test 的独立 macro F1 + 平均
+
+---
+
 ## 断点续传矩阵（v4.2.2 全模块覆盖）
 
 | 阶段 | 模块 | 断点机制 | 保存频率 |

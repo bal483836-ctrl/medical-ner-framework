@@ -79,7 +79,10 @@ def serialize(sample: Dict) -> Tuple[str, str]:
 
 
 def _doc_key(s: Dict) -> str:
-    return str(s.get("doc_id") or s.get("dialogue_id") or s.get("id") or s.get("entity", ""))
+    """带 dataset 前缀，跨数据集合并时防 doc_id 冲突。"""
+    ds = s.get("dataset", "")
+    doc = s.get("doc_id") or s.get("dialogue_id") or s.get("id") or s.get("entity", "")
+    return f"{ds}::{doc}"
 
 
 def group_split(samples, val_ratio=0.1, seed=CLF_SEED):
