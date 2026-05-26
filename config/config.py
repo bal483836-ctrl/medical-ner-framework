@@ -65,6 +65,13 @@ LLM_USE_4BIT           = os.environ.get("MNER_USE_4BIT", "false").lower() == "tr
 LLM_USE_FLASH_ATTN     = os.environ.get("MNER_USE_FLASH_ATTN", "false").lower() == "true"
 LLM_DEVICE_MAP         = "auto"
 
+# 后端：vllm（默认，吞吐高）/ hf（transformers，兼容性好）
+LLM_BACKEND            = os.environ.get("MNER_LLM_BACKEND", "vllm").lower()
+# vLLM 专属：GPU 显存占比、最大序列长度
+LLM_VLLM_GPU_MEMORY_UTIL = float(os.environ.get("MNER_VLLM_MEM_UTIL", "0.90"))
+LLM_VLLM_MAX_MODEL_LEN   = int(os.environ.get("MNER_VLLM_MAX_LEN",   "4096"))
+LLM_VLLM_TP_SIZE         = int(os.environ.get("MNER_VLLM_TP",        "1"))
+
 # ==================== RTX 5090 优化（32GB 显存 / Blackwell sm_120）====================
 # 默认按 5090 跑：BF16 全精度，大 batch，启用 SDPA
 # 显存不足时设 MNER_USE_4BIT=true

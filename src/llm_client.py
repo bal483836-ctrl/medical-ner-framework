@@ -1,9 +1,10 @@
 """
-LLM 客户端（双后端）
+LLM 客户端（双后端：vLLM / transformers）
   - main: Qwen3-32B（主抽取与断言）
   - reflect: DeepSeek（反思校验）
 
 单例懒加载，按名取用：get_llm("main") / get_llm("reflect")
+后端通过 MNER_LLM_BACKEND=vllm|hf 控制，默认 vllm（吞吐显著高）。
 """
 import os
 import re
@@ -17,20 +18,19 @@ from config.config import (
     LLM_MODEL_PATH, REFLECT_MODEL_PATH, LLM_MAX_NEW_TOKENS,
     LLM_REPETITION_PENALTY, LLM_USE_4BIT,
     LLM_USE_FLASH_ATTN, LLM_DEVICE_MAP,
+    LLM_BACKEND, LLM_VLLM_GPU_MEMORY_UTIL, LLM_VLLM_MAX_MODEL_LEN, LLM_VLLM_TP_SIZE,
 )
 
-_INSTANCES = {}   # name -> (model, tokenizer)
-_LOAD_FAILED = {}  # name -> Exception，避免每个 batch 重复尝试加载失败模型
+# name -> {"backend": "vllm"|"hf", ...payload}
+_INSTANCES = {}
+_LOAD_FAILED = {}
 
 
 def _validate_local_model_path(path: str):
-    """LLM 路径必须是本地已存在、含 config.json 的目录，否则给出明确报错。"""
     if not os.path.isdir(path):
         raise FileNotFoundError(
             f"[LLM] 模型目录不存在: {path}\n"
-            f"  → 请确认已下载模型到该路径，或通过环境变量 MNER_MODEL_ROOT 指定父目录。\n"
-            f"  → HuggingFace 把不存在的本地路径当作 repo_id 校验，因而报 "
-            f"'Repo id must be in the form ...' 的迷惑性错误。"
+            f"  → 请确认已下载模型到该路径，或通过 MNER_MODEL_ROOT / MNER_LLM_PATH 指定。"
         )
     if not os.path.exists(os.path.join(path, "config.json")):
         raise FileNotFoundError(
@@ -39,35 +39,82 @@ def _validate_local_model_path(path: str):
         )
 
 
-def _load(path: str):
-    # v4.3: 加载 LLM 前释放 BGE 显存，避免 offload-to-meta OOM
+def _detect_quantization(path: str) -> str:
+    """返回 'awq' / 'gptq' / '' 。"""
+    import json
+    try:
+        with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        qc = cfg.get("quantization_config") or {}
+        method = (qc.get("quant_method") or "").lower()
+        if method in ("awq", "gptq"):
+            return method
+    except Exception:
+        pass
+    base = os.path.basename(path).upper()
+    if "AWQ" in base:
+        return "awq"
+    if "GPTQ" in base:
+        return "gptq"
+    return ""
+
+
+# -------------------- vLLM 后端 --------------------
+
+def _load_vllm(path: str):
+    """加载 vLLM 引擎。需 pip install vllm。"""
     try:
         from src.embedding_model import release_embedding_model
-        import torch, gc
+        import torch
         release_embedding_model()
         torch.cuda.empty_cache(); gc.collect()
-    except Exception as _e:
+    except Exception:
+        pass
+
+    from vllm import LLM, SamplingParams  # noqa: F401  (确认安装)
+
+    quant = _detect_quantization(path)
+    kwargs = dict(
+        model=path,
+        trust_remote_code=True,
+        dtype="auto",
+        gpu_memory_utilization=LLM_VLLM_GPU_MEMORY_UTIL,
+        max_model_len=LLM_VLLM_MAX_MODEL_LEN,
+        tensor_parallel_size=LLM_VLLM_TP_SIZE,
+        enforce_eager=False,
+        disable_log_stats=True,
+    )
+    if quant:
+        kwargs["quantization"] = quant
+    print(f"[LLM/vLLM] 加载 {path}  quant={quant or 'none'}  "
+          f"mem_util={LLM_VLLM_GPU_MEMORY_UTIL}  max_len={LLM_VLLM_MAX_MODEL_LEN}")
+
+    llm = LLM(**kwargs)
+    tok = llm.get_tokenizer()
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    print(f"[LLM/vLLM] 加载完成: {path}")
+    return {"backend": "vllm", "llm": llm, "tokenizer": tok}
+
+
+# -------------------- transformers 后端 --------------------
+
+def _load_hf(path: str):
+    try:
+        from src.embedding_model import release_embedding_model
+        import torch
+        release_embedding_model()
+        torch.cuda.empty_cache(); gc.collect()
+    except Exception:
         pass
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    print(f"\n[LLM] 加载 {path}")
-    print(f"[LLM] 4bit={LLM_USE_4BIT}  FlashAttn={LLM_USE_FLASH_ATTN}")
+    print(f"\n[LLM/HF] 加载 {path}")
+    print(f"[LLM/HF] 4bit={LLM_USE_4BIT}  FlashAttn={LLM_USE_FLASH_ATTN}")
 
-    _validate_local_model_path(path)
-
-    # 检测是否为已量化模型（AWQ / GPTQ），它们 config.json 内自带 quantization_config，
-    # 不能再叠加 bnb 4bit，也不应手动指定 dtype。
-    import json
-    try:
-        with open(os.path.join(path, "config.json"), "r", encoding="utf-8") as _f:
-            _cfg = json.load(_f)
-        _has_quant = "quantization_config" in _cfg
-    except Exception:
-        _has_quant = False
-    _is_prequantized = _has_quant or any(
-        k in os.path.basename(path).upper() for k in ("AWQ", "GPTQ")
-    )
+    quant = _detect_quantization(path)
+    is_prequant = bool(quant)
 
     tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="left")
     if tok.pad_token is None:
@@ -78,8 +125,8 @@ def _load(path: str):
         "device_map": LLM_DEVICE_MAP,
         "attn_implementation": "flash_attention_2" if LLM_USE_FLASH_ATTN else "sdpa",
     }
-    if _is_prequantized:
-        print(f"[LLM] 检测到预量化模型（AWQ/GPTQ），跳过 bnb 4bit、不指定 dtype")
+    if is_prequant:
+        print(f"[LLM/HF] 检测到预量化模型（{quant.upper()}），跳过 bnb 4bit、不指定 dtype")
     else:
         kwargs["dtype"] = torch.bfloat16
         if LLM_USE_4BIT:
@@ -94,8 +141,23 @@ def _load(path: str):
 
     model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
     model.eval()
-    print(f"[LLM] 加载完成: {path}")
-    return model, tok
+    print(f"[LLM/HF] 加载完成: {path}")
+    return {"backend": "hf", "model": model, "tokenizer": tok}
+
+
+# -------------------- 统一入口 --------------------
+
+def _load(path: str):
+    _validate_local_model_path(path)
+    backend = LLM_BACKEND
+    if backend == "vllm":
+        try:
+            return _load_vllm(path)
+        except ImportError as e:
+            print(f"[LLM] vLLM 未安装（{e}），回退 transformers 后端。"
+                  f" 建议: pip install vllm")
+            return _load_hf(path)
+    return _load_hf(path)
 
 
 def get_llm(name: str = "main"):
@@ -112,33 +174,58 @@ def get_llm(name: str = "main"):
     return _INSTANCES[name]
 
 
+def _apply_chat(tokenizer, prompt: str) -> str:
+    msgs = [{"role": "user", "content": prompt}]
+    try:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+
 def batch_generate(
     prompts: List[str],
     max_tokens: int = None,
     retries: int = 3,
     model_name: str = "main",
 ) -> List[str]:
-    """批量推理。失败 OOM 时自动降级单条。"""
-    import torch
+    """批量推理。vLLM 后端会自动连续批处理；HF 后端 OOM 时降级单条。"""
     max_tokens = max_tokens or LLM_MAX_NEW_TOKENS
+    if not prompts:
+        return []
 
-    # 加载失败属于配置错误，不应反复重试。先尝试加载一次，失败直接抛出。
-    model, tokenizer = get_llm(model_name)
+    inst = get_llm(model_name)
+    backend = inst["backend"]
+    tokenizer = inst["tokenizer"]
+    texts = [_apply_chat(tokenizer, p) for p in prompts]
 
+    # --------- vLLM 路径 ---------
+    if backend == "vllm":
+        from vllm import SamplingParams
+        sp = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            repetition_penalty=LLM_REPETITION_PENALTY,
+        )
+        try:
+            outs = inst["llm"].generate(texts, sp, use_tqdm=False)
+        except Exception as e:
+            print(f"  [LLM/vLLM] 推理失败: {e}")
+            return [""] * len(prompts)
+        # vLLM 按输入顺序返回结果
+        return [o.outputs[0].text.strip() if o.outputs else "" for o in outs]
+
+    # --------- HF 路径 ---------
+    import torch
+    model = inst["model"]
     for attempt in range(retries):
         try:
-            texts = []
-            for p in prompts:
-                msgs = [{"role": "user", "content": p}]
-                t = tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-                texts.append(t)
-
             single_lens = [len(tokenizer(t, return_tensors="pt")["input_ids"][0]) for t in texts]
             dyn_len = min(max(single_lens) + 32, 4096)
-
             inputs = tokenizer(
                 texts, return_tensors="pt", padding=True,
                 truncation=True, max_length=dyn_len,
@@ -153,33 +240,28 @@ def batch_generate(
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
-
             in_len = inputs["input_ids"].shape[1]
             return [tokenizer.decode(o[in_len:], skip_special_tokens=True).strip()
                     for o in outputs]
-
         except Exception as e:
             if "out of memory" in str(e).lower():
-                import torch as _t
-                _t.cuda.empty_cache()
-                print(f"  [LLM] OOM 降级单条 batch={len(prompts)}")
-                return _fallback_single(prompts, max_tokens, model_name)
-            print(f"  [LLM] 第 {attempt+1}/{retries} 次失败: {e}")
+                torch.cuda.empty_cache()
+                print(f"  [LLM/HF] OOM 降级单条 batch={len(prompts)}")
+                return _fallback_single_hf(prompts, max_tokens, model_name)
+            print(f"  [LLM/HF] 第 {attempt+1}/{retries} 次失败: {e}")
             if attempt < retries - 1:
                 time.sleep(2)
     return [""] * len(prompts)
 
 
-def _fallback_single(prompts, max_tokens, model_name):
+def _fallback_single_hf(prompts, max_tokens, model_name):
     import torch
-    model, tokenizer = get_llm(model_name)
+    inst = get_llm(model_name)
+    model, tokenizer = inst["model"], inst["tokenizer"]
     results = []
     for p in prompts:
         try:
-            msgs = [{"role": "user", "content": p}]
-            t = tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-            )
+            t = _apply_chat(tokenizer, p)
             ins = tokenizer(t, return_tensors="pt").to(model.device)
             with torch.no_grad():
                 out = model.generate(
@@ -191,7 +273,7 @@ def _fallback_single(prompts, max_tokens, model_name):
                 out[0][ins["input_ids"].shape[1]:], skip_special_tokens=True
             ).strip())
         except Exception as e:
-            print(f"  [LLM] 单条失败: {e}")
+            print(f"  [LLM/HF] 单条失败: {e}")
             results.append("")
     return results
 
@@ -202,7 +284,6 @@ def call_llm(prompt: str, max_tokens: int = None, model_name: str = "main") -> s
 
 
 def clean_llm_output(text: str) -> str:
-    """去 think 链 / markdown / 序号 / 前缀。"""
     if not text:
         return ""
     text = re.sub(r"(?s)<think>.*?(?:</think>|$)", "", text)
@@ -216,19 +297,31 @@ def clean_llm_output(text: str) -> str:
 
 
 def release_llm(name: str = None):
-    """v4.3 加强：先把模型搬到 CPU 再 del，确保 cuda allocator 能真的回收。"""
+    """释放显存。vLLM 引擎也需销毁。"""
     import torch
     keys = list(_INSTANCES.keys()) if name is None else ([name] if name in _INSTANCES else [])
     for k in keys:
-        model, tok = _INSTANCES.pop(k)
+        inst = _INSTANCES.pop(k)
         try:
-            model.cpu()
+            if inst["backend"] == "vllm":
+                # vLLM 没有官方 close()；释放引用 + 触发 GC
+                del inst["llm"]
+            else:
+                try:
+                    inst["model"].cpu()
+                except Exception:
+                    pass
+                del inst["model"]
+            del inst["tokenizer"]
+            del inst
         except Exception:
             pass
-        del model, tok
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
     if keys:
         print(f"  [LLM] 释放显存：{keys}")
