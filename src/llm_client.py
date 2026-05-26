@@ -19,6 +19,7 @@ from config.config import (
     LLM_REPETITION_PENALTY, LLM_USE_4BIT,
     LLM_USE_FLASH_ATTN, LLM_DEVICE_MAP,
     LLM_BACKEND, LLM_VLLM_GPU_MEMORY_UTIL, LLM_VLLM_MAX_MODEL_LEN, LLM_VLLM_TP_SIZE,
+    LLM_VLLM_ENFORCE_EAGER,
 )
 
 # name -> {"backend": "vllm"|"hf", ...payload}
@@ -74,6 +75,9 @@ def _load_vllm(path: str):
     from vllm import LLM, SamplingParams  # noqa: F401  (确认安装)
 
     quant = _detect_quantization(path)
+    # 非量化大模型（如 DeepSeek-V2-Lite BF16 ≈ 30GB）在 32GB 卡上需关掉 CUDA Graph
+    # 否则 cudagraph 捕获会 OOM。可用 MNER_VLLM_EAGER=true 强制开启。
+    eager = LLM_VLLM_ENFORCE_EAGER or (not quant)
     kwargs = dict(
         model=path,
         trust_remote_code=True,
@@ -81,13 +85,14 @@ def _load_vllm(path: str):
         gpu_memory_utilization=LLM_VLLM_GPU_MEMORY_UTIL,
         max_model_len=LLM_VLLM_MAX_MODEL_LEN,
         tensor_parallel_size=LLM_VLLM_TP_SIZE,
-        enforce_eager=False,
+        enforce_eager=eager,
         disable_log_stats=True,
     )
     if quant:
         kwargs["quantization"] = quant
     print(f"[LLM/vLLM] 加载 {path}  quant={quant or 'none'}  "
-          f"mem_util={LLM_VLLM_GPU_MEMORY_UTIL}  max_len={LLM_VLLM_MAX_MODEL_LEN}")
+          f"mem_util={LLM_VLLM_GPU_MEMORY_UTIL}  max_len={LLM_VLLM_MAX_MODEL_LEN}  "
+          f"eager={eager}")
 
     llm = LLM(**kwargs)
     tok = llm.get_tokenizer()

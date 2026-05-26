@@ -71,6 +71,8 @@ LLM_BACKEND            = os.environ.get("MNER_LLM_BACKEND", "vllm").lower()
 LLM_VLLM_GPU_MEMORY_UTIL = float(os.environ.get("MNER_VLLM_MEM_UTIL", "0.90"))
 LLM_VLLM_MAX_MODEL_LEN   = int(os.environ.get("MNER_VLLM_MAX_LEN",   "4096"))
 LLM_VLLM_TP_SIZE         = int(os.environ.get("MNER_VLLM_TP",        "1"))
+# enforce_eager=True 跳过 CUDA Graph 捕获，节省 1-3GB 显存（紧凑显卡必需），代价是 ~10-20% 吞吐
+LLM_VLLM_ENFORCE_EAGER   = os.environ.get("MNER_VLLM_EAGER", "false").lower() == "true"
 
 # ==================== RTX 5090 优化（32GB 显存 / Blackwell sm_120）====================
 # 默认按 5090 跑：BF16 全精度，大 batch，启用 SDPA
