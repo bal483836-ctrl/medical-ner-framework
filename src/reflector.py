@@ -16,7 +16,7 @@ from src.llm_client import batch_generate
 from src.data_processor import clean_entity_list
 from src.utils import atomic_save_json, load_checkpoint
 
-REFLECT_BATCH = 8
+REFLECT_BATCH = int(os.environ.get("MNER_REFLECT_BATCH", "64"))
 SAVE_EVERY_BATCHES = 5
 
 
