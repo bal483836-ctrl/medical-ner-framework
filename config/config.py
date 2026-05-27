@@ -51,8 +51,11 @@ LLM_MODEL_PATH      = os.environ.get(
     "MNER_LLM_PATH",
     os.path.join(MODEL_ROOT, "Qwen3-32B-AWQ"),
 )
-# 反思模型：DeepSeek（用户可改路径）
-REFLECT_MODEL_PATH  = os.path.join(MODEL_ROOT, "DeepSeek-V2-Lite-Chat")
+# 反思模型：DeepSeek，可用 MNER_REFLECT_MODEL_PATH 覆盖
+REFLECT_MODEL_PATH  = os.environ.get(
+    "MNER_REFLECT_MODEL_PATH",
+    os.path.join(MODEL_ROOT, "DeepSeek-V2-Lite-Chat"),
+)
 # 向量模型
 EMBEDDING_MODEL_PATH = os.path.join(MODEL_ROOT, "bge-large-zh-v1.5")
 # 断言分类器基座
