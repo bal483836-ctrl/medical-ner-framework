@@ -129,6 +129,24 @@ def cosine_similarity_matrix(query_vecs: np.ndarray, doc_vecs: np.ndarray) -> np
     return np.dot(query_vecs, doc_vecs.T)
 
 
+# vocab 向量缓存：以 candidates 列表的 id + 长度 为键，避免在 align_*_split 的外层循环里
+# 对几万个候选词重复跑 BGE 编码（这一步是之前 Step2 卡数小时的根因）
+_CAND_VEC_CACHE: dict = {}
+
+
+def _get_candidate_vecs_cached(candidates: List[str]) -> np.ndarray:
+    key = (id(candidates), len(candidates))
+    vecs = _CAND_VEC_CACHE.get(key)
+    if vecs is None:
+        vecs = encode_texts(candidates, is_query=False)
+        _CAND_VEC_CACHE[key] = vecs
+    return vecs
+
+
+def clear_candidate_vec_cache():
+    _CAND_VEC_CACHE.clear()
+
+
 def find_best_matches(
     queries: List[str],
     candidates: List[str],
@@ -159,9 +177,9 @@ def find_best_matches(
     if not needs_embed_queries:
         return results
 
-    # 向量相似度
+    # 向量相似度（candidates 编码缓存：避免被外层循环重复调用时反复编码 vocab）
     query_vecs = encode_texts(needs_embed_queries, is_query=True)
-    cand_vecs  = encode_texts(candidates, is_query=False)
+    cand_vecs  = _get_candidate_vecs_cached(candidates)
     sim_matrix = cosine_similarity_matrix(query_vecs, cand_vecs)
 
     for j, orig_idx in enumerate(needs_embed_idx):
