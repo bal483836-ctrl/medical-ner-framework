@@ -113,40 +113,50 @@ def align_cmeee_split(
     - 高相似度：接受归一化，但扩展词必须通过原文锚定检查
     - 低相似度：保留原词，交给 Step3 大模型验证
     """
+    from tqdm import tqdm
     print(f"\n[Step2] CMeEE 图谱对齐，词汇表大小: {len(vocab)}")
     vocab_set = set(vocab)
+
+    # Pass 1: 跨所有 item 收集去重的待编码实体，一次性批量送 BGE 编码
+    all_needs_embed = set()
+    parsed_items = []
     for item in items:
-        text = item.get("text", "")
         raw_entities = clean_entity_list(
             item.get("step1_enriched_output", item.get("step1_raw_output", ""))
         )
+        parsed_items.append(raw_entities)
+        for ent in raw_entities:
+            if ent and ent not in vocab_set:
+                all_needs_embed.add(ent)
+
+    query_to_match: Dict[str, tuple] = {}
+    if all_needs_embed and vocab:
+        unique_queries = sorted(all_needs_embed)
+        print(f"  [Step2] 去重后待编码实体: {len(unique_queries)} 个，一次性批量编码")
+        matches = find_best_matches(unique_queries, vocab)
+        query_to_match = dict(zip(unique_queries, matches))
+
+    # Pass 2: 按 item 用查表完成对齐
+    for item, raw_entities in tqdm(zip(items, parsed_items), total=len(items),
+                                    desc="Step2 CMeEE align"):
+        text = item.get("text", "")
         if not raw_entities:
             item["step2_aligned_output"] = ""
             continue
-        # 精确匹配先处理
-        exact_matched = []
-        needs_embed   = []
+        aligned_set = set()
         for ent in raw_entities:
             if ent in vocab_set:
-                exact_matched.append(ent)
+                aligned_set.add(ent)
+                continue
+            best_match, score, status = query_to_match.get(ent, ("", 0.0, "low"))
+            if status in ("exact", "high"):
+                if best_match in text:
+                    aligned_set.add(best_match)
+                elif ent in text:
+                    aligned_set.add(ent)
             else:
-                needs_embed.append(ent)
-        # 向量相似度匹配
-        aligned_set = set(exact_matched)
-        if needs_embed and vocab:
-            matches = find_best_matches(needs_embed, vocab)
-            for ent, (best_match, score, status) in zip(needs_embed, matches):
-                if status in ("exact", "high"):
-                    # 原文锚定检查：扩展词必须在原文中出现
-                    if best_match in text:
-                        aligned_set.add(best_match)
-                    elif ent in text:
-                        aligned_set.add(ent)
-                    # 两者都不在原文中，丢弃
-                else:
-                    # 低相似度：保留原词，交给 Step3
-                    if ent in text:
-                        aligned_set.add(ent)
+                if ent in text:
+                    aligned_set.add(ent)
         item["step2_aligned_output"] = ",".join(list(aligned_set))
     _save_json(items, output_path)
     print(f"  ✅ CMeEE Step2 保存至: {output_path}")
@@ -173,49 +183,53 @@ def align_imcs_split(
       - step2_normalized_map：原词->标准词映射，供 Step4 归一化评估使用
       - step2_norm_output：标准词集合，供 Step4 直接读取
     """
+    from tqdm import tqdm
     print(f"\n[Step2] IMCS 图谱对齐，归一化词汇表大小: {len(norm_vocab)}")
     norm_vocab_set = set(norm_vocab)
     oral_mapped_count = 0
     vector_mapped_count = 0
 
+    # Pass 1: 跨所有 item 收集去重的待向量匹配实体，一次性批量编码
+    all_needs_embed = set()
+    parsed_items = []
     for item in items:
         raw_entities = clean_entity_list(item.get("step1_raw_output", ""))
+        parsed_items.append(raw_entities)
+        for ent in raw_entities:
+            if ent and ent not in ORAL_TO_NORM and ent not in norm_vocab_set:
+                all_needs_embed.add(ent)
+
+    query_to_match: Dict[str, tuple] = {}
+    if all_needs_embed and norm_vocab:
+        unique_queries = sorted(all_needs_embed)
+        print(f"  [Step2] 去重后待编码实体: {len(unique_queries)} 个，一次性批量编码")
+        matches = find_best_matches(unique_queries, norm_vocab)
+        query_to_match = dict(zip(unique_queries, matches))
+
+    # Pass 2: 按 item 用查表完成归一化
+    for item, raw_entities in tqdm(zip(items, parsed_items), total=len(items),
+                                    desc="Step2 IMCS align"):
         if not raw_entities:
             item["step2_aligned_output"] = ""
             item["step2_normalized_map"] = {}
             item["step2_norm_output"]    = ""
             continue
-
-        # 构建归一化映射表（原词 -> 标准词）
         norm_map: Dict[str, str] = {}
-        needs_embed = []
-
         for ent in raw_entities:
-            # 第一优先级：手工口语词映射
             if ent in ORAL_TO_NORM:
                 norm_map[ent] = ORAL_TO_NORM[ent]
                 oral_mapped_count += 1
-            # 第二优先级：精确匹配标准词表
             elif ent in norm_vocab_set:
                 norm_map[ent] = ent
-            # 否则需要向量匹配
             else:
-                needs_embed.append(ent)
-
-        # 向量相似度匹配（使用降低后的阈值）
-        if needs_embed and norm_vocab:
-            matches = find_best_matches(needs_embed, norm_vocab)
-            for ent, (best_match, score, status) in zip(needs_embed, matches):
-                # 使用降低后的阈值（0.72 而非 0.82）
+                best_match, score, status = query_to_match.get(ent, ("", 0.0, "low"))
                 if score >= IMCS_HIGH_SIM_THRESHOLD:
                     norm_map[ent] = best_match
                     vector_mapped_count += 1
                 elif score >= IMCS_LOW_SIM_THRESHOLD:
-                    # 中等相似度也接受（0.55-0.72 之间）
                     norm_map[ent] = best_match
                     vector_mapped_count += 1
                 else:
-                    # 低相似度：保留原词（Step4 再次尝试归一化）
                     norm_map[ent] = ent
 
         # step2_aligned_output：保留原词（供 Step3 原文锚定）
