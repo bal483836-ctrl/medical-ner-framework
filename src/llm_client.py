@@ -170,6 +170,12 @@ def get_llm(name: str = "main"):
         return _INSTANCES[name]
     if name in _LOAD_FAILED:
         raise _LOAD_FAILED[name]
+    # 加载新模型前释放其他实例：NER 任务里 main/reflect 不会同时使用，
+    # 而 vLLM 单个模型就占用大量显存（Qwen3-32B-AWQ ~17 GB），不释放会 OOM。
+    others = [k for k in _INSTANCES.keys() if k != name]
+    for k in others:
+        print(f"  [LLM] 加载 {name} 前先释放 {k}")
+        release_llm(k)
     path = LLM_MODEL_PATH if name == "main" else REFLECT_MODEL_PATH
     try:
         _INSTANCES[name] = _load(path)
@@ -301,32 +307,72 @@ def clean_llm_output(text: str) -> str:
     return text
 
 
+def _shutdown_vllm(llm) -> None:
+    """显式关闭 vLLM 引擎的 EngineCore 子进程，否则显存不会真正释放。"""
+    # 新版 vLLM 提供 LLM.shutdown()
+    for attr in ("shutdown",):
+        fn = getattr(llm, attr, None)
+        if callable(fn):
+            try:
+                fn()
+                return
+            except Exception:
+                pass
+    # 兜底：手动停掉 engine_core / executor
+    engine = getattr(llm, "llm_engine", None)
+    if engine is None:
+        return
+    core = getattr(engine, "engine_core", None)
+    if core is not None:
+        for m in ("shutdown", "close"):
+            fn = getattr(core, m, None)
+            if callable(fn):
+                try:
+                    fn()
+                    break
+                except Exception:
+                    pass
+    executor = getattr(engine, "model_executor", None)
+    if executor is not None:
+        fn = getattr(executor, "shutdown", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
 def release_llm(name: str = None):
-    """释放显存。vLLM 引擎也需销毁。"""
+    """释放显存。vLLM 引擎需显式 shutdown 才能真正回收 GPU 内存。"""
     import torch
     keys = list(_INSTANCES.keys()) if name is None else ([name] if name in _INSTANCES else [])
     for k in keys:
         inst = _INSTANCES.pop(k)
         try:
             if inst["backend"] == "vllm":
-                # vLLM 没有官方 close()；释放引用 + 触发 GC
-                del inst["llm"]
+                _shutdown_vllm(inst["llm"])
+                inst["llm"] = None
             else:
                 try:
                     inst["model"].cpu()
                 except Exception:
                     pass
-                del inst["model"]
-            del inst["tokenizer"]
-            del inst
-        except Exception:
-            pass
-    gc.collect()
+                inst["model"] = None
+            inst["tokenizer"] = None
+        except Exception as e:
+            print(f"  [LLM] 释放 {k} 出错（忽略）: {e}")
+    # 多轮 GC + empty_cache，给 vLLM 子进程退出时间
+    for _ in range(3):
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         try:
             torch.cuda.ipc_collect()
         except Exception:
             pass
+    # vLLM 子进程退出本身需要约 1-2 秒
+    time.sleep(2)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if keys:
         print(f"  [LLM] 释放显存：{keys}")
