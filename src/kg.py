@@ -76,11 +76,28 @@ class KnowledgeGraph:
         self._cache_vecs: Optional[np.ndarray] = None
         self._norm_set = set(build_imcs_norm_vocab() or [])
 
-    # ---------- 向量缓存 ----------
+    # ---------- 向量缓存（落盘，避免每次 pipeline 重启都重编码 9 万节点）----------
     def _vectors(self) -> np.ndarray:
-        if self._cache_vecs is None:
-            print(f"  [KG] 编码 {len(self.names)} 个节点向量…")
-            self._cache_vecs = encode_texts(self.names, is_query=False)
+        if self._cache_vecs is not None:
+            return self._cache_vecs
+        import hashlib
+        from config.config import OUTPUT_DIR
+        cache_dir = os.path.join(OUTPUT_DIR, "kg_vec_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        # 用 names 列表的内容指纹 + 长度做 key，节点集变化时自动失效
+        sig = hashlib.md5(("\n".join(self.names)).encode("utf-8")).hexdigest()[:12]
+        cache_path = os.path.join(cache_dir, f"kg_vecs_{len(self.names)}_{sig}.npy")
+        if os.path.exists(cache_path):
+            print(f"  [KG] 复用节点向量缓存: {cache_path}")
+            self._cache_vecs = np.load(cache_path)
+            return self._cache_vecs
+        print(f"  [KG] 编码 {len(self.names)} 个节点向量（首次，会落盘）…")
+        self._cache_vecs = encode_texts(self.names, is_query=False)
+        try:
+            np.save(cache_path, self._cache_vecs)
+            print(f"  [KG] 向量缓存已保存: {cache_path}")
+        except Exception as e:
+            print(f"  [KG] 向量缓存保存失败（忽略）: {e}")
         return self._cache_vecs
 
     # ---------- ① 相似度过滤 ----------

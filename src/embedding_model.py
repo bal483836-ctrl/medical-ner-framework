@@ -53,9 +53,17 @@ def get_embedding_model():
     # 降级：sentence-transformers
     try:
         from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _embed_model = SentenceTransformer(EMBEDDING_MODEL_PATH, device=device)
+        # 显存够时启用 fp16，BGE 编码加速 ~2x
+        if device == "cuda":
+            try:
+                _embed_model = _embed_model.half()
+            except Exception:
+                pass
         _embed_tokenizer = "sentence_transformers"
-        print("[Embed] 使用 sentence-transformers 加载成功")
+        print(f"[Embed] 使用 sentence-transformers 加载成功 (device={device}, fp16={device=='cuda'})")
         return _embed_model, _embed_tokenizer
     except ImportError:
         pass
@@ -85,6 +93,8 @@ def encode_texts(texts: List[str], is_query: bool = True) -> np.ndarray:
         return np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
 
     model, tokenizer = get_embedding_model()
+    # 大批量自动开进度条（避免 Step2 / KG 向量化看起来卡死）
+    show_pb = len(texts) >= 512
 
     # FlagEmbedding
     if tokenizer is None:
@@ -99,13 +109,23 @@ def encode_texts(texts: List[str], is_query: bool = True) -> np.ndarray:
         # BGE 需要加查询指令
         if is_query:
             texts = ["为这个句子生成表示以用于检索相关文章：" + t for t in texts]
-        vecs = model.encode(texts, batch_size=EMBEDDING_BATCH_SIZE, normalize_embeddings=True)
+        vecs = model.encode(
+            texts,
+            batch_size=EMBEDDING_BATCH_SIZE,
+            normalize_embeddings=True,
+            show_progress_bar=show_pb,
+            convert_to_numpy=True,
+        )
         return np.array(vecs, dtype=np.float32)
 
     # transformers 原生
     import torch
+    from tqdm import tqdm
     all_vecs = []
-    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+    rng = range(0, len(texts), EMBEDDING_BATCH_SIZE)
+    if show_pb:
+        rng = tqdm(rng, desc="[Embed]", unit="batch")
+    for i in rng:
         batch = texts[i: i + EMBEDDING_BATCH_SIZE]
         if is_query:
             batch = ["为这个句子生成表示以用于检索相关文章：" + t for t in batch]

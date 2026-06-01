@@ -76,18 +76,33 @@ def save_json(data, path):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def apply_kg_filter(items, kg, field_in, field_out):
-    """对 items 的 field_in 字符串实体列表做 KG 相似度过滤，输出到 field_out。"""
-    for it in items:
+def apply_kg_filter(items, kg, field_in, field_out, marker_key="_kg_filtered"):
+    """对 items 的 field_in 字符串实体列表做 KG 相似度过滤，输出到 field_out。
+    通过 marker_key 跳过已处理项实现断点续传。"""
+    from tqdm import tqdm
+    pending = [it for it in items if not it.get(marker_key)]
+    if not pending:
+        print(f"  [Resume] apply_kg_filter 全部已处理，跳过")
+        return items
+    if len(pending) < len(items):
+        print(f"  [Resume] apply_kg_filter 续跑 {len(pending)}/{len(items)}")
+    for it in tqdm(pending, desc="KG filter", unit="item"):
         ents = clean_entity_list(it.get(field_in, ""))
         if not ents:
             it[field_out] = ""
+            it[marker_key] = True
             continue
         kept = kg.filter_by_similarity(
             ents, threshold=HIGH_SIM_THRESHOLD, skip_normalized=True,
         )
         it[field_out] = ",".join(kept)
+        it[marker_key] = True
     return items
+
+
+def _is_complete(items, key):
+    """所有 item 都已写过 key 且非 None → 该阶段已完整。"""
+    return bool(items) and all(key in it and it.get(key) is not None for it in items)
 
 
 def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
@@ -112,9 +127,14 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
                 print(f"  ⚠️ 缺 Step1 输出，跳过"); continue
 
         if args.step is None or args.step == 1:
-            print(f"[Step1.5] 嵌套扩展…")
-            items = enrich_cmeee_step1(items, cmeee_vocab, long_min_len=args.cmeee_long_min)
-            save_json(items, p1e)
+            cached = load_existing(p1e)
+            if cached and _is_complete(cached, "step1_enriched_output"):
+                print(f"  [Resume] Step1.5 已完成 → {p1e}")
+                items = cached
+            else:
+                print(f"[Step1.5] 嵌套扩展…")
+                items = enrich_cmeee_step1(items, cmeee_vocab, long_min_len=args.cmeee_long_min)
+                save_json(items, p1e)
         else:
             tmp = load_existing(p1e)
             if tmp: items = tmp
@@ -130,7 +150,12 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
             save_json(items, p1e)
 
         if args.step is None or args.step == 2:
-            items = align_cmeee_split(items, cmeee_vocab, p2)
+            cached = load_existing(p2)
+            if cached and _is_complete(cached, "step2_aligned_output"):
+                print(f"  [Resume] Step2 已完成 → {p2}")
+                items = cached
+            else:
+                items = align_cmeee_split(items, cmeee_vocab, p2)
         else:
             tmp = load_existing(p2)
             if tmp: items = tmp
@@ -186,27 +211,30 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
             save_json(items, p1)
 
         if args.step is None or args.step == 2:
-            items = align_imcs_split(items, norm_vocab, p2)
-            # 6 级级联兜底：对仍未对齐的原词再走一次（提升归一化召回）
-            print("[Step2.3] 6 级归一化级联兜底…")
-            nv_set = set(norm_vocab or [])
-            for it in items:
-                norm_map = it.get("step2_normalized_map", {}) or {}
-                raw_ents = list(norm_map.keys()) or clean_entity_list(
-                    it.get("step1_raw_output", ""))
-                # 只对还映射到自身（未归一化）的实体走级联
-                unaligned = [e for e, n in norm_map.items() if e == n]
-                if not unaligned:
-                    continue
-                res = imcs_normalize_list(unaligned, nv_set)
-                for e, n in res["norm_map"].items():
-                    if n and n != e:
-                        norm_map[e] = n
-                it["step2_normalized_map"] = norm_map
-                # 重新生成 step2_norm_output
-                norm_set = list(dict.fromkeys(norm_map.values()))
-                it["step2_norm_output"] = ",".join(norm_set)
-            save_json(items, p2)
+            cached = load_existing(p2)
+            if cached and _is_complete(cached, "step2_aligned_output") \
+                    and all("step2_normalized_map" in it for it in cached):
+                print(f"  [Resume] IMCS Step2 + Step2.3 已完成 → {p2}")
+                items = cached
+            else:
+                items = align_imcs_split(items, norm_vocab, p2)
+                # 6 级级联兜底：对仍未对齐的原词再走一次（提升归一化召回）
+                print("[Step2.3] 6 级归一化级联兜底…")
+                nv_set = set(norm_vocab or [])
+                for it in items:
+                    norm_map = it.get("step2_normalized_map", {}) or {}
+                    # 只对还映射到自身（未归一化）的实体走级联
+                    unaligned = [e for e, n in norm_map.items() if e == n]
+                    if not unaligned:
+                        continue
+                    res = imcs_normalize_list(unaligned, nv_set)
+                    for e, n in res["norm_map"].items():
+                        if n and n != e:
+                            norm_map[e] = n
+                    it["step2_normalized_map"] = norm_map
+                    norm_set = list(dict.fromkeys(norm_map.values()))
+                    it["step2_norm_output"] = ",".join(norm_set)
+                save_json(items, p2)
         else:
             tmp = load_existing(p2)
             if tmp: items = tmp
