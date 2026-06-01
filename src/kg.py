@@ -123,6 +123,41 @@ class KnowledgeGraph:
                 kept.append(e)
         return list(dict.fromkeys(kept))
 
+    # ---------- ①' 批量预判：一次性把所有未命中实体编码并判定，存为 dict ----------
+    def precompute_filter_decisions(
+        self,
+        entities: List[str],
+        threshold: float = HIGH_SIM_THRESHOLD,
+        skip_normalized: bool = True,
+    ) -> Dict[str, bool]:
+        """
+        给定一批跨 item 收集的去重实体，返回 {entity: pass_filter(bool)}。
+        命中 norm_set / nodes 的直接 True；其余批量 BGE 编码 + 矩阵乘判定。
+        避免 apply_kg_filter 在外层循环里反复发起微批 GPU 调用。
+        """
+        decisions: Dict[str, bool] = {}
+        to_check: List[str] = []
+        for e in entities:
+            if not e:
+                continue
+            if e in decisions:
+                continue
+            if skip_normalized and e in self._norm_set:
+                decisions[e] = True
+            elif e in self.nodes:
+                decisions[e] = True
+            else:
+                to_check.append(e)
+                decisions[e] = False   # 占位，下面更新
+        if to_check and self.names:
+            print(f"  [KG] 批量判定 {len(to_check)} 个去重未命中实体…")
+            qv = encode_texts(to_check, is_query=True)
+            sims = cosine_similarity_matrix(qv, self._vectors())
+            maxes = sims.max(axis=1)
+            for i, e in enumerate(to_check):
+                decisions[e] = bool(float(maxes[i]) >= threshold)
+        return decisions
+
     # ---------- ② 语义扩展（含反向索引）----------
     def expand(self, entity: str, topk: int = 5) -> Dict[str, List[str]]:
         """

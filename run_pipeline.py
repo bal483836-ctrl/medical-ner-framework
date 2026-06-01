@@ -77,8 +77,8 @@ def save_json(data, path):
 
 
 def apply_kg_filter(items, kg, field_in, field_out, marker_key="_kg_filtered"):
-    """对 items 的 field_in 字符串实体列表做 KG 相似度过滤，输出到 field_out。
-    通过 marker_key 跳过已处理项实现断点续传。"""
+    """KG 相似度过滤。两阶段：① 跨 item 收集去重实体→一次性 GPU 批量编码并判定；
+       ② 按 item 查表生成输出。通过 marker_key 支持断点续传。"""
     from tqdm import tqdm
     pending = [it for it in items if not it.get(marker_key)]
     if not pending:
@@ -86,15 +86,32 @@ def apply_kg_filter(items, kg, field_in, field_out, marker_key="_kg_filtered"):
         return items
     if len(pending) < len(items):
         print(f"  [Resume] apply_kg_filter 续跑 {len(pending)}/{len(items)}")
-    for it in tqdm(pending, desc="KG filter", unit="item"):
+
+    # 阶段一：去重收集所有候选实体
+    all_ents = set()
+    parsed = []
+    for it in pending:
         ents = clean_entity_list(it.get(field_in, ""))
+        parsed.append(ents)
+        all_ents.update(ents)
+
+    # 阶段二：一次性 KG 批量判定（命中 norm/nodes 直 True，其余批量 BGE）
+    decisions = kg.precompute_filter_decisions(
+        list(all_ents),
+        threshold=HIGH_SIM_THRESHOLD,
+        skip_normalized=True,
+    )
+
+    # 阶段三：按 item 查表，仅做 O(1) lookup，无 GPU
+    for it, ents in tqdm(zip(pending, parsed), total=len(pending),
+                          desc="KG filter", unit="item"):
         if not ents:
             it[field_out] = ""
             it[marker_key] = True
             continue
-        kept = kg.filter_by_similarity(
-            ents, threshold=HIGH_SIM_THRESHOLD, skip_normalized=True,
-        )
+        kept = [e for e in ents if decisions.get(e, False)]
+        # 保留入参顺序、去重
+        kept = list(dict.fromkeys(kept))
         it[field_out] = ",".join(kept)
         it[marker_key] = True
     return items
