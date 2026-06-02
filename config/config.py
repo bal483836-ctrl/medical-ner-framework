@@ -92,11 +92,11 @@ EMBEDDING_DIM        = 1024
 
 # ==================== 相似度阈值（KG 过滤）====================
 EXACT_MATCH_THRESHOLD = 1.0
-HIGH_SIM_THRESHOLD    = 0.80   # 论文要求：余弦相似度 ≥ 0.80 才保留
-LOW_SIM_THRESHOLD     = 0.60
+HIGH_SIM_THRESHOLD    = float(os.environ.get("MNER_HIGH_SIM", "0.80"))   # 论文要求：余弦相似度 ≥ 0.80 才保留
+LOW_SIM_THRESHOLD     = float(os.environ.get("MNER_LOW_SIM",  "0.60"))
 
 # ==================== 少样本 / 预学习配置 ====================
-FEW_SHOT_COUNT          = 8
+FEW_SHOT_COUNT          = int(os.environ.get("MNER_FEWSHOT_K", "8"))
 FEW_SHOT_SEED           = 42
 PREANALYSIS_SAMPLE_SIZE = 100   # 阶段 2 预学习挖掘的样本数
 

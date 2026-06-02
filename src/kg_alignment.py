@@ -150,10 +150,13 @@ def align_cmeee_split(
                 continue
             best_match, score, status = query_to_match.get(ent, ("", 0.0, "low"))
             if status in ("exact", "high"):
-                if best_match in text:
-                    aligned_set.add(best_match)
-                elif ent in text:
+                # CMeEE 评估按文本片段匹配，优先保留原文出现的原词形态。
+                # 仅在原词不在原文、但 KG 归一化词在原文时才用 best_match 替换。
+                if ent in text:
                     aligned_set.add(ent)
+                elif best_match in text:
+                    aligned_set.add(best_match)
+                # 两者都不在原文中，丢弃
             else:
                 if ent in text:
                     aligned_set.add(ent)
