@@ -268,13 +268,65 @@ def extract_imcs_split(
 
     print(f"  [IMCS {split}] 共 {len(turn_meta)} 个对话轮次，开始批量推理...")
 
-    # ---- 批量推理所有轮次 ----
-    all_prompts   = [m[4] for m in turn_meta]
-    all_responses = []
-    for bs in tqdm(range(0, len(all_prompts), IMCS_TURN_BATCH_SIZE), desc=f"IMCS {split} 轮次推理"):
-        all_responses.extend(
-            batch_generate(all_prompts[bs: bs + IMCS_TURN_BATCH_SIZE], max_tokens=128)
-        )
+    # ---- turn-level 断点缓存：用 (dialogue_id, t_idx, hash(sentence[:80])) 做 key ----
+    #      允许在 3699 步推理 loop 中途被杀也不重跑已完成的轮次
+    import hashlib
+    turn_cache_path = output_path + ".turncache.json"
+    turn_cache: Dict[str, str] = {}
+    if os.path.exists(turn_cache_path):
+        try:
+            with open(turn_cache_path, "r", encoding="utf-8") as f:
+                turn_cache = json.load(f)
+            print(f"  [Resume] IMCS {split} turn cache: {len(turn_cache)} 个轮次已缓存")
+        except Exception:
+            turn_cache = {}
+
+    def _turn_key(d_idx: int, t_idx: int, sentence: str) -> str:
+        # 用 pending 索引 + 轮次号 + 句子内容指纹保证唯一稳定
+        did = pending[d_idx].get("dialogue_id", pending[d_idx].get("id", d_idx))
+        h = hashlib.md5(sentence.encode("utf-8")).hexdigest()[:8]
+        return f"{did}::{t_idx}::{h}"
+
+    # ---- 批量推理所有未缓存的轮次 ----
+    all_responses: List[str] = []
+    pending_indices = []   # 在 turn_meta 中的索引，需要重新推理的
+    for ri, (d_idx, t_idx, sentence, _, _) in enumerate(turn_meta):
+        k = _turn_key(d_idx, t_idx, sentence)
+        if k in turn_cache:
+            all_responses.append(turn_cache[k])
+        else:
+            all_responses.append(None)   # 占位
+            pending_indices.append(ri)
+
+    if pending_indices:
+        print(f"  [IMCS {split}] 待推理轮次: {len(pending_indices)}/{len(turn_meta)}")
+        SAVE_EVERY_BATCHES = 50
+        batch_n = 0
+        for bs in tqdm(range(0, len(pending_indices), IMCS_TURN_BATCH_SIZE),
+                       desc=f"IMCS {split} 轮次推理"):
+            chunk_idx = pending_indices[bs: bs + IMCS_TURN_BATCH_SIZE]
+            chunk_prompts = [turn_meta[i][4] for i in chunk_idx]
+            chunk_resps = batch_generate(chunk_prompts, max_tokens=128)
+            for local_i, ri in enumerate(chunk_idx):
+                resp = chunk_resps[local_i] if local_i < len(chunk_resps) else ""
+                all_responses[ri] = resp
+                d_idx, t_idx, sentence, _, _ = turn_meta[ri]
+                turn_cache[_turn_key(d_idx, t_idx, sentence)] = resp
+            batch_n += 1
+            if batch_n % SAVE_EVERY_BATCHES == 0:
+                try:
+                    with open(turn_cache_path, "w", encoding="utf-8") as f:
+                        json.dump(turn_cache, f, ensure_ascii=False)
+                except Exception as e:
+                    print(f"  [IMCS] turn cache 写入失败（忽略）: {e}")
+        # 最后强制落一次盘
+        try:
+            with open(turn_cache_path, "w", encoding="utf-8") as f:
+                json.dump(turn_cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+    else:
+        print(f"  [IMCS {split}] 所有轮次都已在 turn cache 中，跳过推理")
 
     # ---- 分配结果到各对话轮次 ----
     d_turn_results: Dict[int, Dict[int, dict]] = {d: {} for d in range(len(pending))}
