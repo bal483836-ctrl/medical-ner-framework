@@ -162,26 +162,102 @@ def _format_demos(demos, dataset_name):
 
 # ==================== LLM Skill 生成 ====================
 
+# 给 LLM 看的"易混淆/非医学"反例（与 demos 一起喂入），帮助 skills 写出过滤规则
+_NEG_HINTS = {
+    "CMeEE_V2": """以下词在原文中常出现但**几乎从不**被 CMeEE 金标标注，属于噪声：
+- 性别年龄：男/女/男孩/女孩/患者/患儿/新生儿/婴儿/儿童/成人
+- 时间副词：今天/昨天/以前/最近/反复/经常/突然/长期/持续
+- 部位修饰：左/右/双/上/下/前/后/内/外/正常/异常
+- 数值单位：mg/kg/ml/mmHg/℃/%/次/天/周/月/年
+- 治疗/检查的动词形态：治疗/诊断/检查/观察/给予/服用/注射
+- 模糊描述：一些/部分/可能/相关/常见/严重/明显
+""",
+    "IMCS_V2": """以下词在儿科对话原文常出现但**几乎从不**被 IMCS 金标标注为症状：
+- 药物/药品：蒙脱石散/益生菌/罗红霉素/补液/口服液/妈咪爱/小儿氨酚黄那敏
+- 检查/项目：便常规/血常规/B超/拍片/水电解质
+- 病因诱因：受凉/吹风/腹部受冷/吃多了/食积/挑食/纯母乳喂养
+- 患者称谓：男孩/女孩/宝宝/孩子/患儿
+- 询问语气：有没有/是否/会不会/要不要
+- 否定形态：不发烧/没拉稀/没什么大碍/未见
+- 模糊描述：精神状态/大便次数多/特别粘/还可以
+- 舌象（IMCS 不属症状）：舌苔黄/舌苔厚/舌尖红/舌红
+""",
+    "yidu_4k": """以下词在电子病历常出现但**几乎从不**被 yidu_4k 金标标注：
+- 时间日期：年/月/日/天/小时/分钟/AM/PM
+- 数值剂量：mg/g/ml/kg/L/mmHg/g/L
+- 医务人员：医生/护士/主任/医师
+- 主诉前缀：主诉/现病史/查体/体格检查（这些是文段标题，不是实体）
+- 一般动作：服用/给予/检查/复查/观察
+- 模糊词：一般/正常/异常/常见/严重
+""",
+}
+
+
 def _meta_prompt(demos_text: str, dataset_name: str) -> str:
     if dataset_name == "CMeEE_V2":
-        ds_desc = "中文医学文献的 9 类实体识别（dis 疾病/sym 症状/pro 操作/equ 设备/dru 药物/ite 指标/bod 部位/mic 微生物/dep 科室）"
+        ds_desc = "中文医学文献的 9 类医学实体识别（dis 疾病/sym 症状/pro 操作/equ 设备/dru 药物/ite 指标/bod 部位/mic 微生物/dep 科室）"
+        scope = "**必须是医学相关实体**，非医学词（地名/人名/产品名/数值/时间/副词）一律不抽"
     elif dataset_name == "IMCS_V2":
         ds_desc = "儿科医患对话中的症状识别（抽原文形态，不归一化）"
+        scope = "**只抽症状/体征**，药物/检查项目/病因诱因/疾病诊断/患者描述 都不属于本任务"
     else:
-        ds_desc = "电子病历的 6 类实体识别（疾病/影像/检验/药物/解剖/手术）"
+        ds_desc = "电子病历的 6 类医学实体（疾病/影像/检验/药物/解剖/手术）"
+        scope = "**必须是医学实体**，时间/数值/医务人员称谓/段落标题都不抽"
 
-    return f"""你是 NER 专家。仔细观察以下 {ds_desc} 标注样本，归纳出 6-10 条**可立即执行的抽取技巧**。
+    neg_hints = _NEG_HINTS.get(dataset_name, "")
 
-# 样本
+    return f"""你是 NER 标注规范专家。任务：观察 {ds_desc} 的真实标注样本，归纳出一套**让 LLM 在抽取时既能高召回又能过滤垃圾**的范式化规则。
+
+# 任务范围
+{scope}
+
+# 正例（带金标的真实样本）
 {demos_text}
 
-# 要求
-- 每条 1-2 句，告诉 LLM "看到什么模式 → 应该做什么"
-- 必须基于上述样本观察，不能凭空写
-- 拒绝抽象建议（如"要仔细分析"）
+# 易混淆反例提示（这些词在原文中常出现但 gold 不标，属于必须过滤的噪声）
+{neg_hints}
 
-# 输出格式（直接列表，无前缀解释）
-【技巧1】..."""
+# 你要产出的 skills（共 10-14 条，分 4 个段落）
+
+【必抽规则】（5-6 条）：每条描述一种"看到 X 模式 → 必须抽出"的范式
+  - 给具体模式描述（前缀/后缀/词性/语境）
+  - 配一个原样从样本中观察到的实例
+  - 重点关注容易被漏抽的类型（如 ite/pro/equ 在 CMeEE，痰/精神软/绿便 在 IMCS）
+
+【过滤规则】（3-4 条）：每条描述一种"看到 X 模式 → 坚决不抽"的范式
+  - 来自上方反例提示和你在 demos 中观察到的 gold 没有标的高频词
+  - 描述判断逻辑（如"动词形态 + 名词" / "数值 + 单位" / "时间副词"）
+
+【医学性判定】（2 条）：如何判别一个词是医学实体 vs 非医学日常词
+  - 列出医学词的特征（专业术语后缀/解剖结构名/疾病分类前缀/...）
+  - 列出非医学词的快速排除方法
+
+【边界规则】（2-3 条）：实体的起止位置怎么切
+  - 嵌套抽 vs 不抽
+  - 前缀修饰语保留 vs 剥离
+  - 后缀助词（了/的/吗）必须去掉
+
+# 严格要求
+1. 每条规则**1-2 句**，必须可被另一个 LLM 直接执行
+2. 必须基于上方样本观察到的真实模式，**禁止凭空写**
+3. 禁止抽象建议（如"要仔细分析"、"考虑上下文"）
+4. **明确强调医学性**：任何规则不能让模型抽出非医学词
+5. **明确强调过滤垃圾**：每条必抽规则配套思考"会不会误抽噪声"
+
+# 输出格式（严格按段，无任何额外解释）
+【必抽规则】
+1. ...
+2. ...
+...
+【过滤规则】
+1. ...
+...
+【医学性判定】
+1. ...
+2. ...
+【边界规则】
+1. ...
+..."""
 
 
 def _parse_skills(raw: str) -> str:
@@ -192,15 +268,72 @@ def _parse_skills(raw: str) -> str:
     return raw.strip()
 
 
+# meta-prompt 改了就 bump 这个值，老缓存自动失效重生
+SKILLS_SCHEMA_VERSION = "v2-structured"
+
+
+def _self_verify_and_refine(skills: str, demos_text: str, dataset_name: str) -> str:
+    """
+    让 LLM 用刚生成的 skills 在第 1 个 demo 上 dry-run：
+    - 模拟抽取 → 自检漏抽/误抽 → 修正 skills
+    - 最多 1 轮（避免无限循环）
+
+    输入 demos_text 里第一段就是 demo 1 包含原文+gold，足够 LLM 对照。
+    """
+    from src.llm_client import call_llm
+    verify_prompt = f"""你刚为 {dataset_name} 写了一套 NER 抽取 skills。现在请按这套 skills 对【样本 1】做实战模拟：
+
+# 你的 skills
+{skills}
+
+# 训练样本（你能看到 gold 答案）
+{demos_text}
+
+# 任务
+1. 严格按照你写的 skills，对【样本 1】抽取实体（"模拟输出"）
+2. 与 gold 对比，找出：
+   - 漏抽：gold 有但模拟输出没有
+   - 误抽：模拟输出有但 gold 没有
+3. 如果漏抽/误抽涉及某种**模式**（不是个例），修改对应的 skills 条款（加强必抽 / 增加过滤）
+
+# 输出格式（严格按段）
+<dryrun>
+模拟输出: ...
+漏抽: ...
+误抽: ...
+问题模式: ...（如果有）
+</dryrun>
+
+<final_skills>
+（修改后的完整 skills，保持原 4 段结构【必抽规则】【过滤规则】【医学性判定】【边界规则】。如果原 skills 已经够好就原样输出）
+</final_skills>"""
+    try:
+        raw = call_llm(verify_prompt, max_tokens=2048, model_name="main")
+        # 提取 <final_skills> 块
+        m = re.search(r"<final_skills>([\s\S]*?)</final_skills>", raw, re.IGNORECASE)
+        if m:
+            refined = _parse_skills(m.group(1))
+            if refined and len(refined) >= len(skills) * 0.6:
+                print(f"  ✓ skills 自校验已细化")
+                return refined
+        print(f"  ℹ️ skills 自校验未产生有效修订，保留原版")
+    except Exception as e:
+        print(f"  ⚠️ skills 自校验失败（忽略）: {e}")
+    return skills
+
+
 def _llm_generate_skills(dataset_name: str, demos_text: str,
                         cache_path: str, force: bool = False) -> str:
     if not force and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached.get("skills") and cached.get("dataset") == dataset_name:
+            if (cached.get("skills") and cached.get("dataset") == dataset_name
+                    and cached.get("schema_version") == SKILLS_SCHEMA_VERSION):
                 print(f"  ✓ 复用 LLM skills 缓存: {cache_path}")
                 return cached["skills"]
+            if cached.get("schema_version") != SKILLS_SCHEMA_VERSION:
+                print(f"  ⚠️ skills schema 升级 ({cached.get('schema_version','无')} → {SKILLS_SCHEMA_VERSION})，重新生成…")
         except Exception:
             pass
 
@@ -214,17 +347,23 @@ def _llm_generate_skills(dataset_name: str, demos_text: str,
         from src.llm_client import call_llm
         print(f"  🤖 LLM 生成 {dataset_name} skills（看 demos）…")
         raw = call_llm(_meta_prompt(demos_text, dataset_name),
-                       max_tokens=1024, model_name="main")
+                       max_tokens=2048, model_name="main")
         skills = _parse_skills(raw)
-        if not skills or len(skills) < 60:
+        if not skills or len(skills) < 100:
             raise ValueError("LLM 输出过短")
+
+        # === 自校验：让 LLM 用刚生成的 skills 在 1 个 demo 上 dry-run ===
+        if os.environ.get("MNER_SKILLS_DRYRUN", "true").lower() == "true":
+            print(f"  🔍 skills 自校验（用一个 demo dry-run）…")
+            skills = _self_verify_and_refine(skills, demos_text, dataset_name)
     except Exception as e:
         print(f"  ⚠️ LLM skills 生成失败 ({e})，使用后备")
         skills = fallback.strip()
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump({"dataset": dataset_name, "skills": skills},
+        json.dump({"dataset": dataset_name, "skills": skills,
+                   "schema_version": SKILLS_SCHEMA_VERSION},
                   f, ensure_ascii=False, indent=2)
     return skills
 
