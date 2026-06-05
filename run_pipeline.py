@@ -78,8 +78,23 @@ def save_json(data, path):
 
 def apply_kg_filter(items, kg, field_in, field_out, marker_key="_kg_filtered"):
     """KG 相似度过滤。两阶段：① 跨 item 收集去重实体→一次性 GPU 批量编码并判定；
-       ② 按 item 查表生成输出。通过 marker_key 支持断点续传。"""
+       ② 按 item 查表生成输出。通过 marker_key 支持断点续传。
+
+    模式：
+      - MNER_KG_FILTER_MODE=filter（默认）：KG 不命中则删除（旧行为）
+      - MNER_KG_FILTER_MODE=boost：保留全部，只在 _kg_score 字段标记是否命中
+      - MNER_KG_FILTER_MODE=off：完全跳过（不动 field_out）
+    """
     from tqdm import tqdm
+    mode = os.environ.get("MNER_KG_FILTER_MODE", "filter").lower()
+    if mode == "off":
+        print(f"  [KG filter] 已禁用 (MNER_KG_FILTER_MODE=off)")
+        for it in items:
+            if not it.get(field_out):
+                it[field_out] = it.get(field_in, "")
+            it[marker_key] = True
+        return items
+
     pending = [it for it in items if not it.get(marker_key)]
     if not pending:
         print(f"  [Resume] apply_kg_filter 全部已处理，跳过")
@@ -102,16 +117,20 @@ def apply_kg_filter(items, kg, field_in, field_out, marker_key="_kg_filtered"):
         skip_normalized=True,
     )
 
-    # 阶段三：按 item 查表，仅做 O(1) lookup，无 GPU
-    for it, ents in tqdm(zip(pending, parsed), total=len(pending),
-                          desc="KG filter", unit="item"):
+    # 阶段三：按 item 查表
+    desc = f"KG {mode}"
+    for it, ents in tqdm(zip(pending, parsed), total=len(pending), desc=desc, unit="item"):
         if not ents:
             it[field_out] = ""
             it[marker_key] = True
             continue
-        kept = [e for e in ents if decisions.get(e, False)]
-        # 保留入参顺序、去重
-        kept = list(dict.fromkeys(kept))
+        if mode == "boost":
+            # 全保留；只在 _kg_score_map 里记一份判定
+            kept = list(dict.fromkeys(ents))
+            it["_kg_hit_map"] = {e: bool(decisions.get(e, False)) for e in kept}
+        else:
+            kept = [e for e in ents if decisions.get(e, False)]
+            kept = list(dict.fromkeys(kept))
         it[field_out] = ",".join(kept)
         it[marker_key] = True
     return items
@@ -264,12 +283,19 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
                                     field_out="step2_aligned_output")
             save_json(items, p2)
 
-        if not args.no_step3 and (args.step is None or args.step == 3):
+        # IMCS Step3：可通过 MNER_IMCS_SKIP_STEP3=true 跳过（数据分析显示 Step3 LLM 审核
+        # 净伤 IMCS F1 -1~2 点，主要在乱删标准症状词如「痰」「感冒」「精神软」等）
+        skip_imcs_step3 = os.environ.get("MNER_IMCS_SKIP_STEP3", "false").lower() == "true"
+        if not args.no_step3 and not skip_imcs_step3 and (args.step is None or args.step == 3):
             items = filter_imcs_with_llm(items, p3)
-        elif args.no_step3:
+        elif args.no_step3 or skip_imcs_step3:
+            # 直接用 step2_norm_output 作为最终输出（归一化后的标准词）
             for it in items:
-                it.setdefault("step3_final_output", it.get("step2_aligned_output", ""))
+                src = it.get("step2_norm_output") or it.get("step2_aligned_output", "")
+                it.setdefault("step3_final_output", src)
             save_json(items, p3)
+            if skip_imcs_step3:
+                print("  [Skip] IMCS Step3 已跳过 (MNER_IMCS_SKIP_STEP3=true)，直接使用 step2_norm_output")
 
         if has_label and (args.step is None or args.step == 4):
             eval_results.append(evaluate_imcs(items, split, norm_vocab))
