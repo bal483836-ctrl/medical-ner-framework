@@ -21,7 +21,7 @@ from config.config import (
     OUTPUT_DIR, STEP3_PREFIX,
     IMCS_FORCE_RECALL_WORDS,
 )
-from src.llm_client import call_llm, clean_llm_output
+from src.llm_client import call_llm, clean_llm_output, batch_generate
 from src.data_processor import clean_entity_list
 
 # ==================== CMeEE 规则过滤 ====================
@@ -258,43 +258,34 @@ def filter_imcs_with_llm(
             print(f"  ⚠️ 断点损坏: {e}")
 
     processed = 0
-    for item in items:
-        # 已完成则跳过
+    # ---- 第一遍：仅做规则 / 锚定 / 兜底，准备好需要 LLM 审核的 prompt ----
+    pending_idx: List[int] = []      # 在 items 中的下标
+    pending_prompts: List[str] = []
+    pending_anchored: List[List[str]] = []
+    pending_fulltext: List[str] = []
+    for i, item in enumerate(items):
         if item.get("step3_final_output") is not None:
             continue
-        # 关键修复：用 step2_aligned_output（原词）做锚定，而不是 step2_norm_output
         candidates = clean_entity_list(
             item.get("step2_aligned_output", item.get("step1_raw_output", ""))
         )
-
-        # 构建原文（用于锚定检查）
         full_text = (
             item.get("self_report", "") + " " +
             " ".join(t.get("sentence", "") for t in item.get("dialogue", []))
         )
-
-        # Step 3a: 规则预过滤（删除明显非症状词）
         candidates = _rule_filter_imcs(candidates)
-
-        # Step 3b: 原文锚定过滤（用原词检查，不用标准词）
         anchored = []
         for ent in candidates:
-            score = _text_anchor_score(full_text, ent)
-            if score >= anchor_threshold:
+            if _text_anchor_score(full_text, ent) >= anchor_threshold:
                 anchored.append(ent)
-
-        # Step 3c: 强召回兜底（确保关键体征不丢失）
         anchored_set = set(anchored)
         for force_word in IMCS_FORCE_RECALL_WORDS:
             if force_word in full_text and force_word not in anchored_set:
                 anchored.append(force_word)
                 anchored_set.add(force_word)
-
         if not anchored:
             item["step3_final_output"] = ""
             continue
-
-        # Step 3d: 大模型审核（审核原词，不审核标准词）
         cands_str = ", ".join(anchored)
         prompt = f"""你是严谨的医学专家，请对以下候选实体列表进行清洗，只保留真正的症状和疾病实体。
 
@@ -323,31 +314,51 @@ def filter_imcs_with_llm(
 
 【候选实体】：{cands_str}
 【通过审核的实体】："""
-        raw_output = call_llm(prompt, max_tokens=256)
-        cleaned    = clean_llm_output(raw_output)
-        final_ents = clean_entity_list(cleaned)
+        pending_idx.append(i)
+        pending_prompts.append(prompt)
+        pending_anchored.append(anchored)
+        pending_fulltext.append(full_text)
 
-        # Step 3e: 强召回兜底（大模型可能误删关键词，再补一次）
-        final_set = set(final_ents)
-        for force_word in IMCS_FORCE_RECALL_WORDS:
-            if force_word in full_text and force_word not in final_set:
-                final_ents.append(force_word)
-                final_set.add(force_word)
+    if not pending_prompts:
+        _save_json(items, output_path)
+        print(f"  ✅ IMCS Step3 保存至: {output_path}（全部已完成）")
+        return items
 
-        # Step 3f: 口语词替换（将口语词替换为标准词，提升字面 F1）
-        # 注意：只替换在 ORAL_TO_NORM_STEP3 中有明确映射的口语词
-        normalized_ents = []
-        seen = set()
-        for ent in final_ents:
-            norm_ent = ORAL_TO_NORM_STEP3.get(ent, ent)
-            if norm_ent not in seen:
-                seen.add(norm_ent)
-                normalized_ents.append(norm_ent)
-
-        item["step3_final_output"] = ",".join(normalized_ents)
-        processed += 1
-        if save_every and processed % save_every == 0:
-            _save_json(items, output_path)
+    # ---- 第二遍：批量调用 LLM（vLLM 连续批处理友好），tqdm 显示进度 ----
+    from tqdm import tqdm
+    LLM_BATCH = int(os.environ.get("MNER_IMCS_STEP3_BATCH", "32"))
+    print(f"  [Step3 IMCS] 待审核 {len(pending_prompts)} 条，LLM batch={LLM_BATCH}")
+    for bs in tqdm(range(0, len(pending_prompts), LLM_BATCH),
+                   desc="IMCS Step3 LLM 审核"):
+        chunk_idx     = pending_idx[bs: bs + LLM_BATCH]
+        chunk_prompts = pending_prompts[bs: bs + LLM_BATCH]
+        chunk_anc     = pending_anchored[bs: bs + LLM_BATCH]
+        chunk_text    = pending_fulltext[bs: bs + LLM_BATCH]
+        resps = batch_generate(chunk_prompts, max_tokens=256)
+        for k, item_idx in enumerate(chunk_idx):
+            item = items[item_idx]
+            raw_output = resps[k] if k < len(resps) else ""
+            cleaned    = clean_llm_output(raw_output)
+            final_ents = clean_entity_list(cleaned)
+            # Step 3e: 强召回兜底
+            full_text  = chunk_text[k]
+            final_set  = set(final_ents)
+            for force_word in IMCS_FORCE_RECALL_WORDS:
+                if force_word in full_text and force_word not in final_set:
+                    final_ents.append(force_word)
+                    final_set.add(force_word)
+            # Step 3f: 口语词替换为标准词
+            normalized_ents = []
+            seen = set()
+            for ent in final_ents:
+                norm_ent = ORAL_TO_NORM_STEP3.get(ent, ent)
+                if norm_ent not in seen:
+                    seen.add(norm_ent)
+                    normalized_ents.append(norm_ent)
+            item["step3_final_output"] = ",".join(normalized_ents)
+            processed += 1
+        # 每批落盘一次，崩了最多丢 LLM_BATCH 条
+        _save_json(items, output_path)
 
     _save_json(items, output_path)
     print(f"  ✅ IMCS Step3 保存至: {output_path}")
