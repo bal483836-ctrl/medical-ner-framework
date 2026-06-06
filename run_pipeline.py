@@ -46,7 +46,10 @@ from src.utils import set_global_seed, print_gpu_banner, stage_banner, kv_print
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--quick-test", action="store_true")
+    p.add_argument("--quick-test", action="store_true",
+                   help="每个 split 只跑 20 条（极快，仅冒烟测试）")
+    p.add_argument("--smoke", type=int, default=0,
+                   help="每个 split 限制条数（如 --smoke 200 跑 200 条 dev/train/test）")
     p.add_argument("--dataset", choices=["cmeee", "imcs", "yidu", "all"], default="all")
     p.add_argument("--split", choices=["train", "dev", "test", "all"], default="all")
     p.add_argument("--step", type=int, choices=[1, 2, 3, 4], default=None)
@@ -58,9 +61,12 @@ def parse_args():
     return p.parse_args()
 
 
+_SMOKE_TAG = ""   # 由 main() 在解析 args 后设置；smoke 模式下加 ".smoke{N}" 后缀隔离缓存
+
+
 def get_path(prefix, ds, split):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, f"{prefix}{ds}_{split}.json")
+    return os.path.join(OUTPUT_DIR, f"{prefix}{ds}_{split}{_SMOKE_TAG}.json")
 
 
 def load_existing(path):
@@ -144,7 +150,7 @@ def _is_complete(items, key):
 def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
     splits_cfg = DATASET_SPLITS["CMeEE_V2"]
     targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
-    limit = 20 if args.quick_test else None
+    limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
     eval_results = []
 
     for sc in targets:
@@ -221,7 +227,7 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
 def run_imcs(args, few_shot_str, norm_vocab, kg):
     splits_cfg = DATASET_SPLITS["IMCS_V2"]
     targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
-    limit = 20 if args.quick_test else None
+    limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
     eval_results = []
 
     for sc in targets:
@@ -307,7 +313,7 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
 def run_yidu(args, few_shot_str, kg):
     print(f"\n{'='*60}\n  🟡 yidu_4k [train]\n{'='*60}")
     p1 = get_path(STEP1_PREFIX, "yidu_4k", "train")
-    limit = 20 if args.quick_test else None
+    limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
     if args.step is None or args.step == 1:
         items = extract_yidu(few_shot_str, p1, limit=limit)
     else:
@@ -332,6 +338,14 @@ def main():
     t0 = time.time()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"\n{'='*70}\n  🏥 医疗 NER 框架 v4.2  (RTX 5090 优化)\n{'='*70}")
+    # smoke 模式：所有产物加 .smoke{N} 后缀隔离，不污染 full-run 缓存
+    global _SMOKE_TAG
+    if args.smoke and args.smoke > 0:
+        _SMOKE_TAG = f".smoke{args.smoke}"
+        print(f"  🧪 SMOKE 模式：每 split 限 {args.smoke} 条，输出文件加后缀 {_SMOKE_TAG}")
+    elif args.quick_test:
+        _SMOKE_TAG = ".smoke20"
+        print(f"  🧪 QUICK-TEST 模式：每 split 限 20 条，输出文件加后缀 {_SMOKE_TAG}")
     set_global_seed()
     print_gpu_banner()
 
