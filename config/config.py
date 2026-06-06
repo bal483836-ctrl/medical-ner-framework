@@ -51,10 +51,12 @@ LLM_MODEL_PATH      = os.environ.get(
     "MNER_LLM_PATH",
     os.path.join(MODEL_ROOT, "Qwen3-32B-AWQ"),
 )
-# 反思模型：DeepSeek，可用 MNER_REFLECT_MODEL_PATH 覆盖
+# 反思模型：默认走 Qwen2.5-14B-Instruct-AWQ（量化版，~9 GB 显存，单卡可同时与主模型共存）
+# 原 DeepSeek-V2-Lite-Chat BF16 = 29.45 GB 在 32GB 卡上装不下，已不再作默认。
+# 如确实有更大显存或想用 DeepSeek，export MNER_REFLECT_MODEL_PATH=/path/to/model 覆盖。
 REFLECT_MODEL_PATH  = os.environ.get(
     "MNER_REFLECT_MODEL_PATH",
-    os.path.join(MODEL_ROOT, "DeepSeek-V2-Lite-Chat"),
+    os.path.join(MODEL_ROOT, "Qwen2.5-14B-Instruct-AWQ"),
 )
 # 向量模型
 EMBEDDING_MODEL_PATH = os.path.join(MODEL_ROOT, "bge-large-zh-v1.5")
