@@ -100,6 +100,16 @@ def run_ner_smoke(dataset_tag: str, n: int):
     norm_vocab  = build_imcs_norm_vocab()
     kg = load_kg()
 
+    # ----- 检索式动态 few-shot 检索器 -----
+    from config.config import RETRIEVAL_FEWSHOT
+    cmeee_retriever = imcs_retriever = None
+    if RETRIEVAL_FEWSHOT:
+        from src.retrieval_fewshot import build_cmeee_retriever, build_imcs_retriever
+        if dataset_tag in ("cmeee", "all"):
+            cmeee_retriever = build_cmeee_retriever()
+        if dataset_tag in ("imcs", "all"):
+            imcs_retriever = build_imcs_retriever()
+
     eval_results = []
 
     # ============================ CMeEE ============================
@@ -117,7 +127,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
             p3  = os.path.join(OUTPUT_DIR, f"smoke_{STEP3_PREFIX}CMeEE_V2_{split}.json")
 
             print("  ▶ Step1: 大模型抽取")
-            items = extract_cmeee_split(split, cmeee_fs, p1, limit=n)
+            items = extract_cmeee_split(split, cmeee_fs, p1, limit=n, retriever=cmeee_retriever)
             preview_items(items, n=2, fields=("text", "step1_raw_output", "gold_entities_str"))
 
             print("\n  ▶ Step1.5: 嵌套扩展")
@@ -163,7 +173,7 @@ def run_ner_smoke(dataset_tag: str, n: int):
             p3 = os.path.join(OUTPUT_DIR, f"smoke_{STEP3_PREFIX}IMCS_V2_{split}.json")
 
             print("  ▶ Step1: 对话按角色逐轮抽取")
-            items = extract_imcs_split(split, imcs_fs, p1, limit=n)
+            items = extract_imcs_split(split, imcs_fs, p1, limit=n, retriever=imcs_retriever)
             preview_items(items, n=2, fields=("dialogue_id", "step1_raw_output", "gold_entities_str"))
 
             print("\n  ▶ Step1.7: DeepSeek 反思")

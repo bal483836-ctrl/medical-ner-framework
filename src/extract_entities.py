@@ -20,8 +20,9 @@ from config.config import (
     OUTPUT_DIR, STEP1_PREFIX,
     CMEEE_TYPE_MAP, IMCS_FORCE_RECALL_WORDS,
     IMCS_TARGET_SYMPTOM_TYPES,
-    FEW_SHOT_COUNT,
+    FEW_SHOT_COUNT, RETRIEVAL_FEWSHOT_K, IMCS_VOCAB_RECALL,
 )
+from src.retrieval_fewshot import load_symptom_norm_vocab, imcs_vocab_recall
 from src.llm_client import batch_generate, clean_llm_output
 from src.data_processor import (
     load_cmeee, load_imcs, load_yidu,
@@ -77,18 +78,22 @@ def build_imcs_turn_prompt(
     """
     IMCS 单轮对话实体抽取 Prompt（精简版）
     """
-    return f"""儿科对话NER任务。从【当前发言】抽取**患者的症状/体征**，原文原样输出，逗号分隔。
+    return f"""儿科对话NER任务。从【当前发言】抽取**患者的症状/体征及医生给出的疾病判断**，原文原样输出，逗号分隔。
 **宁可多抽不可漏抽**。
 
 ✅ 抽（症状/体征）：发烧/咳嗽/拉肚子/吐奶/流鼻涕/鼻塞/腹胀/腹痛/绿便/水样便/精神差/没精神/哭闹/放屁/夜咳/嗓子哑/38.5度
+✅ 也抽（IMCS 把这些诊断/感染/发热分级也算 symptom_norm，**必须抽**）：
+   感冒/病毒感染/细菌感染/支原体感染/呼吸道感染/上呼吸道感染/支气管炎/肺炎/消化不良/
+   低热/中等度热/高热（即使由医生说出、即使是诊断结论，也要抽）
 
-🚫 不抽：药名/检查项目/病因诱因/患者称谓/医务动作/舌象/否定句中的症状
+🚫 不抽：具体药名/检查项目（血常规、X光）/患者称谓/医务动作/舌象/否定句中的症状
 
 规则：
 ①原文原样复制，禁止归一化（『拉肚子』保留『拉肚子』，不要写『腹泻』）
 ②保留完整描述（『绿色的大便』不简化为『大便』）
 ③微小体征也要抽：放屁/没精神/尿少/哭闹/夜咳
-④无症状则输出"无"
+④医生说的疾病/感染/发热分级结论也要抽（如『考虑病毒感染』抽『病毒感染』）
+⑤无症状则输出"无"
 
 示例：
 {few_shot_str}
@@ -174,8 +179,13 @@ def extract_cmeee_split(
     few_shot_str: str,
     output_path: str,
     limit: Optional[int] = None,
+    retriever=None,
 ) -> List[Dict]:
-    """CMeEE 指定 split 批量实体抽取，支持断点续跑"""
+    """CMeEE 指定 split 批量实体抽取，支持断点续跑。
+
+    retriever 非空时启用检索式动态 few-shot：每条文本检索最相似的 train 样本，
+    否则回退到全局固定 few_shot_str。
+    """
     done_ids, results = set(), []
     if os.path.exists(output_path):
         with open(output_path, "r", encoding="utf-8") as f:
@@ -200,7 +210,18 @@ def extract_cmeee_split(
 
     for batch_start in tqdm(range(0, len(pending), CMEEE_BATCH_SIZE), desc=f"CMeEE {split}"):
         batch = pending[batch_start: batch_start + CMEEE_BATCH_SIZE]
-        prompts = [build_cmeee_prompt(item.get("text", ""), few_shot_str) if item.get("text") else "" for item in batch]
+        prompts = []
+        for item in batch:
+            text = item.get("text", "")
+            if not text:
+                prompts.append("")
+                continue
+            fs = few_shot_str
+            if retriever is not None:
+                rfs = retriever.retrieve_block(text, k=RETRIEVAL_FEWSHOT_K)
+                if rfs:
+                    fs = rfs
+            prompts.append(build_cmeee_prompt(text, fs))
 
         valid_idx = [i for i, p in enumerate(prompts) if p]
         responses = batch_generate([prompts[i] for i in valid_idx], max_tokens=256) if valid_idx else []
@@ -232,11 +253,15 @@ def extract_imcs_split(
     few_shot_str: str,
     output_path: str,
     limit: Optional[int] = None,
+    retriever=None,
 ) -> List[Dict]:
     """
     IMCS 指定 split 批量实体抽取，支持断点续跑
     策略：收集所有轮次 prompt → 一次性批量推理 → 按轮次分配结果
+    retriever 非空时对每个发言检索最相似的 train 轮次作为 few-shot。
     """
+    # 闭集兜底召回词表（331 个 symptom_norm，含诊断/感染/发热分级）
+    _norm_vocab = load_symptom_norm_vocab() if IMCS_VOCAB_RECALL else []
     done_ids, results = set(), []
     if os.path.exists(output_path):
         with open(output_path, "r", encoding="utf-8") as f:
@@ -270,7 +295,12 @@ def extract_imcs_split(
             speaker  = turn.get("speaker", "未知")
             ctx = "\n".join(history_texts[-3:]) if history_texts else "（无）"
             if sentence:
-                prompt = build_imcs_turn_prompt(sentence, speaker, self_report, ctx, few_shot_str)
+                fs = few_shot_str
+                if retriever is not None:
+                    rfs = retriever.retrieve_block(sentence, k=RETRIEVAL_FEWSHOT_K)
+                    if rfs:
+                        fs = rfs
+                prompt = build_imcs_turn_prompt(sentence, speaker, self_report, ctx, fs)
                 turn_meta.append((d_idx, t_idx, sentence, self_report, prompt))
             history_texts.append(f"{speaker}: {sentence}")
 
@@ -371,9 +401,15 @@ def extract_imcs_split(
 
         # 强召回兜底
         full_text = self_report + " " + " ".join(t.get("sentence", "") for t in dialogue)
-        for w in IMCS_FORCE_RECALL_WORDS:
-            if w in full_text:
+        if _norm_vocab:
+            # 闭集召回：扫描整段对话命中 331 个 symptom_norm 词（含诊断/感染/发热分级）
+            # 并做否定语境过滤，直接补回「感冒/支气管炎/病毒感染」等漏检词
+            for w in imcs_vocab_recall(full_text, _norm_vocab):
                 doc_preds.add(w)
+        else:
+            for w in IMCS_FORCE_RECALL_WORDS:
+                if w in full_text:
+                    doc_preds.add(w)
 
         item["step1_raw_output"] = ",".join(list(doc_preds))
         results.append(item)

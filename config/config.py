@@ -102,6 +102,13 @@ FEW_SHOT_COUNT          = int(os.environ.get("MNER_FEWSHOT_K", "8"))
 FEW_SHOT_SEED           = 42
 PREANALYSIS_SAMPLE_SIZE = 100   # 阶段 2 预学习挖掘的样本数
 
+# 检索式动态 few-shot（kNN/GPT-NER）：为每条输入检索最相似的 train 样本注入 prompt
+# 关闭则回退到全局固定 few-shot。需要 BGE 可用；不可用时自动回退。
+RETRIEVAL_FEWSHOT       = os.environ.get("MNER_RETRIEVAL_FEWSHOT", "1") == "1"
+RETRIEVAL_FEWSHOT_K     = int(os.environ.get("MNER_RETRIEVAL_K", str(FEW_SHOT_COUNT)))
+# IMCS 闭集兜底召回：扫描整段对话命中 symptom_norm 闭集词（含诊断/感染/发热分级）
+IMCS_VOCAB_RECALL       = os.environ.get("MNER_IMCS_VOCAB_RECALL", "1") == "1"
+
 # ==================== CMeEE 实体类型 ====================
 CMEEE_TYPE_MAP = {
     "dis": "疾病", "sym": "症状", "pro": "手术操作", "equ": "医疗设备",

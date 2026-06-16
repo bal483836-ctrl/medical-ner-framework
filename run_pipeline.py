@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config.config import (
     OUTPUT_DIR, DATASET_SPLITS,
     STEP1_PREFIX, STEP1E_PREFIX, STEP2_PREFIX, STEP3_PREFIX,
-    HIGH_SIM_THRESHOLD,
+    HIGH_SIM_THRESHOLD, RETRIEVAL_FEWSHOT,
 )
 from src.extract_entities import (
     build_global_few_shot,
@@ -147,7 +147,7 @@ def _is_complete(items, key):
     return bool(items) and all(key in it and it.get(key) is not None for it in items)
 
 
-def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
+def run_cmeee(args, few_shot_str, cmeee_vocab, kg, retriever=None):
     splits_cfg = DATASET_SPLITS["CMeEE_V2"]
     targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
     limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
@@ -162,7 +162,7 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
         p3  = get_path(STEP3_PREFIX,  "CMeEE_V2", split)
 
         if args.step is None or args.step == 1:
-            items = extract_cmeee_split(split, few_shot_str, p1, limit=limit)
+            items = extract_cmeee_split(split, few_shot_str, p1, limit=limit, retriever=retriever)
         else:
             items = load_existing(p1)
             if items is None:
@@ -224,7 +224,7 @@ def run_cmeee(args, few_shot_str, cmeee_vocab, kg):
     return eval_results
 
 
-def run_imcs(args, few_shot_str, norm_vocab, kg):
+def run_imcs(args, few_shot_str, norm_vocab, kg, retriever=None):
     splits_cfg = DATASET_SPLITS["IMCS_V2"]
     targets = [s for s in splits_cfg if args.split in ("all", s["split"])]
     limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
@@ -238,7 +238,7 @@ def run_imcs(args, few_shot_str, norm_vocab, kg):
         p3 = get_path(STEP3_PREFIX, "IMCS_V2", split)
 
         if args.step is None or args.step == 1:
-            items = extract_imcs_split(split, few_shot_str, p1, limit=limit)
+            items = extract_imcs_split(split, few_shot_str, p1, limit=limit, retriever=retriever)
         else:
             items = load_existing(p1)
             if items is None:
@@ -373,12 +373,22 @@ def main():
     norm_vocab = build_imcs_norm_vocab()
     kg = load_kg()
 
+    # ----- 检索式动态 few-shot 检索器（kNN/GPT-NER）-----
+    cmeee_retriever = imcs_retriever = None
+    if RETRIEVAL_FEWSHOT and args.step in (None, 1):
+        print("\n[Phase] 构建检索式 few-shot 检索器…")
+        from src.retrieval_fewshot import build_cmeee_retriever, build_imcs_retriever
+        if args.dataset in ("cmeee", "all"):
+            cmeee_retriever = build_cmeee_retriever()
+        if args.dataset in ("imcs", "all"):
+            imcs_retriever = build_imcs_retriever()
+
     # ----- 分发 -----
     all_eval = []
     if args.dataset in ("cmeee", "all"):
-        all_eval.extend(run_cmeee(args, cmeee_fs, cmeee_vocab, kg))
+        all_eval.extend(run_cmeee(args, cmeee_fs, cmeee_vocab, kg, retriever=cmeee_retriever))
     if args.dataset in ("imcs", "all"):
-        all_eval.extend(run_imcs(args, imcs_fs, norm_vocab, kg))
+        all_eval.extend(run_imcs(args, imcs_fs, norm_vocab, kg, retriever=imcs_retriever))
     if args.dataset in ("yidu", "all"):
         run_yidu(args, cmeee_fs, kg)
 
