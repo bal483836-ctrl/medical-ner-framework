@@ -108,6 +108,8 @@ class RetrievalFewShot:
         self.queries = [q for q, _ in examples]
         self.blocks = [b for _, b in examples]
         self.vecs: Optional[np.ndarray] = None
+        # 查询向量缓存：text -> vec。预热后检索全程走 numpy，无需在 LLM 循环里调 BGE。
+        self.qcache: Dict[str, np.ndarray] = {}
 
     # ---- 缓存键：训练样本文本内容哈希 ----
     def _cache_key(self) -> str:
@@ -138,20 +140,40 @@ class RetrievalFewShot:
             pass
         return self
 
+    def precompute_queries(self, texts: List[str]) -> None:
+        """一次性批量编码所有待检索文本（在 LLM 加载前调用），之后检索纯 numpy。
+
+        这是避免 OOM / 加速的关键：原先每条输入在 LLM 循环里单独调 BGE，
+        既慢（GPU 串行）又让 BGE 与 vLLM 同时占显存。
+        """
+        uniq = list(dict.fromkeys(t for t in texts if t))
+        uniq = [t for t in uniq if t not in self.qcache]
+        if not uniq:
+            return
+        from src.embedding_model import encode_texts
+        print(f"  [Retrieval] {self.name}: 预编码 {len(uniq)} 条待检索文本...")
+        vecs = encode_texts(uniq, is_query=True)
+        for t, v in zip(uniq, vecs):
+            self.qcache[t] = v
+
     def retrieve_block(self, text: str, k: int = FEW_SHOT_COUNT) -> str:
         """检索 top-k 相似示例，拼成 few-shot 字符串。失败回退空串。"""
         if self.vecs is None or len(self.queries) == 0 or not text:
             return ""
+        qv = self.qcache.get(text)
+        if qv is None:
+            # 未预热的回退路径（慢）：单条编码
+            try:
+                from src.embedding_model import encode_texts
+                qv = encode_texts([text], is_query=True)[0]
+            except Exception:
+                return ""
         try:
-            from src.embedding_model import encode_texts
-            qv = encode_texts([text], is_query=True)  # (1, d)
-            sims = np.dot(qv, self.vecs.T)[0]          # (N,)
+            sims = self.vecs @ qv                       # (N,)
             top = np.argsort(-sims)[:k]
-            blocks = [self.blocks[i] for i in top]
-            # 重新编号
             lines = []
-            for n, blk in enumerate(blocks, 1):
-                lines.append(blk.replace("{i}", str(n)))
+            for n, idx in enumerate(top, 1):
+                lines.append(self.blocks[idx].replace("{i}", str(n)))
             return "\n".join(lines)
         except Exception:
             return ""
@@ -161,6 +183,7 @@ class RetrievalFewShot:
 
 def build_cmeee_retriever(max_examples: int = 3000) -> Optional[RetrievalFewShot]:
     """从 CMeEE train 构建检索器：示例 = 原文 → gold 实体名。"""
+    from config.config import RETRIEVAL_EXAMPLE_MAXLEN
     try:
         data = load_cmeee("train")
     except Exception as e:
@@ -174,7 +197,9 @@ def build_cmeee_retriever(max_examples: int = 3000) -> Optional[RetrievalFewShot
         names = extract_cmeee_gold_names(item)
         if not names:
             continue
-        block = f"示例{{i}}：\n文本：{text}\n实体：{', '.join(names)}\n"
+        # 截断展示文本，控制 prompt 长度（检索仍用全文编码）
+        shown = text if len(text) <= RETRIEVAL_EXAMPLE_MAXLEN else text[:RETRIEVAL_EXAMPLE_MAXLEN] + "…"
+        block = f"示例{{i}}：\n文本：{shown}\n实体：{', '.join(names)}\n"
         examples.append((text, block))
         if len(examples) >= max_examples:
             break
@@ -239,3 +264,42 @@ def build_imcs_retriever(max_examples: int = 4000) -> Optional[RetrievalFewShot]
     except Exception as e:
         print(f"  [Retrieval] IMCS 编码失败，回退全局 few-shot：{e}")
         return None
+
+
+# ==================== 查询预热（在 LLM 加载前批量编码）====================
+
+def prewarm_cmeee_queries(retriever: Optional[RetrievalFewShot],
+                          splits: List[str], limit: Optional[int] = None) -> None:
+    if retriever is None:
+        return
+    texts: List[str] = []
+    for sp in splits:
+        try:
+            data = load_cmeee(sp)
+        except Exception:
+            continue
+        if limit:
+            data = data[:limit]
+        texts.extend((it.get("text") or "") for it in data)
+    retriever.precompute_queries(texts)
+
+
+def prewarm_imcs_queries(retriever: Optional[RetrievalFewShot],
+                         splits: List[str], limit: Optional[int] = None) -> None:
+    if retriever is None:
+        return
+    sents: List[str] = []
+    for sp in splits:
+        try:
+            data = load_imcs(sp)
+        except Exception:
+            continue
+        if limit:
+            data = data[:limit]
+        for it in data:
+            for turn in it.get("dialogue", []) or []:
+                # 用与 extract_imcs_split 完全一致的原始 sentence 作为缓存键（勿 strip）
+                s = turn.get("sentence", "")
+                if s:
+                    sents.append(s)
+    retriever.precompute_queries(sents)

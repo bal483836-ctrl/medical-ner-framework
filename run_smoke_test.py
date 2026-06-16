@@ -100,15 +100,25 @@ def run_ner_smoke(dataset_tag: str, n: int):
     norm_vocab  = build_imcs_norm_vocab()
     kg = load_kg()
 
-    # ----- 检索式动态 few-shot 检索器 -----
+    # ----- 检索式动态 few-shot 检索器（LLM 加载前完成所有 BGE 编码并释放）-----
     from config.config import RETRIEVAL_FEWSHOT
     cmeee_retriever = imcs_retriever = None
     if RETRIEVAL_FEWSHOT:
-        from src.retrieval_fewshot import build_cmeee_retriever, build_imcs_retriever
+        from src.retrieval_fewshot import (
+            build_cmeee_retriever, build_imcs_retriever,
+            prewarm_cmeee_queries, prewarm_imcs_queries,
+        )
         if dataset_tag in ("cmeee", "all"):
             cmeee_retriever = build_cmeee_retriever()
+            prewarm_cmeee_queries(cmeee_retriever, ["train", "dev"], limit=n)
         if dataset_tag in ("imcs", "all"):
             imcs_retriever = build_imcs_retriever()
+            prewarm_imcs_queries(imcs_retriever, ["train", "dev"], limit=n)
+        try:
+            from src.embedding_model import release_embedding_model
+            release_embedding_model()
+        except Exception:
+            pass
 
     eval_results = []
 

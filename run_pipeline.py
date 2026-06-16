@@ -374,14 +374,33 @@ def main():
     kg = load_kg()
 
     # ----- 检索式动态 few-shot 检索器（kNN/GPT-NER）-----
+    # 关键：在 LLM 加载前用 BGE 一次性编码 train 示例 + 所有待检索文本，
+    #       然后立即释放 BGE，检索全程走 numpy，避免 BGE 与 vLLM 显存共存 OOM。
     cmeee_retriever = imcs_retriever = None
     if RETRIEVAL_FEWSHOT and args.step in (None, 1):
-        print("\n[Phase] 构建检索式 few-shot 检索器…")
-        from src.retrieval_fewshot import build_cmeee_retriever, build_imcs_retriever
+        print("\n[Phase] 构建检索式 few-shot 检索器（LLM 加载前完成所有 BGE 编码）…")
+        from src.retrieval_fewshot import (
+            build_cmeee_retriever, build_imcs_retriever,
+            prewarm_cmeee_queries, prewarm_imcs_queries,
+        )
+        limit = args.smoke if args.smoke > 0 else (20 if args.quick_test else None)
         if args.dataset in ("cmeee", "all"):
+            sp = [s["split"] for s in DATASET_SPLITS["CMeEE_V2"]
+                  if args.split in ("all", s["split"])]
             cmeee_retriever = build_cmeee_retriever()
+            prewarm_cmeee_queries(cmeee_retriever, sp, limit=limit)
         if args.dataset in ("imcs", "all"):
+            sp = [s["split"] for s in DATASET_SPLITS["IMCS_V2"]
+                  if args.split in ("all", s["split"])]
             imcs_retriever = build_imcs_retriever()
+            prewarm_imcs_queries(imcs_retriever, sp, limit=limit)
+        # 释放 BGE 显存，给 vLLM 让路
+        try:
+            from src.embedding_model import release_embedding_model
+            release_embedding_model()
+            print("  [Retrieval] BGE 已释放，检索改走 numpy")
+        except Exception as e:
+            print(f"  [Retrieval] BGE 释放失败（不影响正确性）：{e}")
 
     # ----- 分发 -----
     all_eval = []

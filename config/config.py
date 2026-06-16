@@ -105,7 +105,10 @@ PREANALYSIS_SAMPLE_SIZE = 100   # 阶段 2 预学习挖掘的样本数
 # 检索式动态 few-shot（kNN/GPT-NER）：为每条输入检索最相似的 train 样本注入 prompt
 # 关闭则回退到全局固定 few-shot。需要 BGE 可用；不可用时自动回退。
 RETRIEVAL_FEWSHOT       = os.environ.get("MNER_RETRIEVAL_FEWSHOT", "1") == "1"
-RETRIEVAL_FEWSHOT_K     = int(os.environ.get("MNER_RETRIEVAL_K", str(FEW_SHOT_COUNT)))
+# K 默认 4（不是 8）：检索示例已高度相关，K 太大只会撑长 prompt → 紧凑显卡 prefill OOM
+RETRIEVAL_FEWSHOT_K     = int(os.environ.get("MNER_RETRIEVAL_K", "4"))
+# 单条检索示例展示文本上限（字符），控制 prompt 长度；检索仍用全文编码
+RETRIEVAL_EXAMPLE_MAXLEN = int(os.environ.get("MNER_RETRIEVAL_EXLEN", "100"))
 # IMCS 闭集兜底召回：扫描整段对话命中 symptom_norm 闭集词（含诊断/感染/发热分级）
 IMCS_VOCAB_RECALL       = os.environ.get("MNER_IMCS_VOCAB_RECALL", "1") == "1"
 
