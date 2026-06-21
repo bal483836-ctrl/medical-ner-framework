@@ -68,12 +68,48 @@ def _mark_entity_in_context(ctx: str, ent: str) -> str:
     return f"【{ent}】{ctx}"
 
 
+# v2: 显式断言线索词检测，作为结构化特征注入
+_NEG_CUES = ["未见", "无", "否认", "不存在", "排除", "阴性", "没有", "未发现"]
+_SPEC_CUES = ["考虑", "可能", "疑似", "不排除", "怀疑", "或为", "拟诊"]
+
+
+def _detect_cues(ctx: str) -> Tuple[bool, bool]:
+    """返回 (有否定线索, 有推测线索)。"""
+    has_neg = any(c in ctx for c in _NEG_CUES)
+    has_spec = any(c in ctx for c in _SPEC_CUES)
+    return has_neg, has_spec
+
+
+def _kg_struct_features(sample: Dict) -> str:
+    """
+    v2 创新 G：把 KG 结构化信号显式编码进 query，
+    让分类器不用从语境隐式推理。
+    特别有用于"知识事实"判别：possible_diseases 多 + 无患者指向 → General。
+    """
+    exp = sample.get("expansion", {}) or {}
+    ctx = sample.get("context", "")
+    n_possible = len(exp.get("possible_diseases") or [])
+    n_facts = len(exp.get("kg_facts") or [])
+    has_neg, has_spec = _detect_cues(ctx)
+    # 离散桶位特征
+    pd_bucket = "无" if n_possible == 0 else ("少" if n_possible <= 2 else "多")
+    fact_bucket = "无" if n_facts == 0 else ("少" if n_facts <= 2 else "多")
+    flags = []
+    flags.append(f"KG关联疾病={pd_bucket}")
+    flags.append(f"KG事实={fact_bucket}")
+    flags.append(f"否定线索={'有' if has_neg else '无'}")
+    flags.append(f"推测线索={'有' if has_spec else '无'}")
+    return " ".join(flags)
+
+
 def serialize(sample: Dict) -> Tuple[str, str]:
-    """返回 (query, context_text) 双输入。"""
+    """返回 (query, context_text) 双输入。
+    v2: query 拼接 KG 结构化特征（创新 G）。"""
     ent = sample.get("entity", "")
     ctx = sample.get("context", "")
     kg  = _kg_to_str(sample.get("expansion", {}))
-    query = f"实体：{ent} 知识：{kg}"
+    struct = _kg_struct_features(sample)
+    query = f"实体：{ent} [STRUCT]{struct}[/STRUCT] 知识：{kg}"
     context_text = f"语境：{_mark_entity_in_context(ctx, ent)}"
     return query, context_text
 

@@ -172,13 +172,27 @@ def annotate(samples: List[Dict],
                 if v == 0:
                     raw_first[i] = r[:200]
 
-        # 多数票
+        # 多数票 + 置信度分层（v2 核心改动）
         for i in idxs:
             cnt = Counter(votes[i])
-            status_en, _ = cnt.most_common(1)[0]
+            status_en, top_n = cnt.most_common(1)[0]
+            total_v = sum(cnt.values()) or 1
+            agreement = top_n / total_v   # 0.33 / 0.50 / 0.67 / 1.0 ...
+            # 置信度分桶（vote_passes=3 时）：
+            #   1.00  → strong   (3/3 一致)
+            #   0.67  → medium   (2/3 一致)
+            #   <0.67 → weak     (分散)
+            if agreement >= 1.0 - 1e-6:
+                confidence = "strong"
+            elif agreement >= 0.5:
+                confidence = "medium"
+            else:
+                confidence = "weak"
             samples[i]["label"]       = _to_zh_label(status_en)
             samples[i]["label_en"]    = status_en
             samples[i]["vote_dist"]   = dict(cnt)
+            samples[i]["vote_agreement"] = round(agreement, 3)
+            samples[i]["vote_confidence"] = confidence   # strong/medium/weak
             samples[i]["llm_raw"]     = raw_first.get(i, "")
 
         batch_count += 1
@@ -188,6 +202,41 @@ def annotate(samples: List[Dict],
     if output_path:
         atomic_save_json(samples, output_path)
     return samples
+
+
+def filter_by_confidence(samples: List[Dict],
+                          min_confidence: str = "medium") -> List[Dict]:
+    """
+    按置信度过滤标注样本，用于训练数据清洗。
+
+    min_confidence:
+      - "strong" : 只保留 3/3 一致的（最干净，量最少）
+      - "medium" : strong + medium (2/3 一致；常用，量适中)
+      - "weak"   : 全部（含 1/3 分散；最噪声）
+
+    返回过滤后的样本列表，并打印分桶统计。
+    """
+    rank = {"strong": 3, "medium": 2, "weak": 1}
+    cutoff = rank.get(min_confidence, 2)
+
+    buckets = {"strong": 0, "medium": 0, "weak": 0, "missing": 0}
+    kept = []
+    for s in samples:
+        conf = s.get("vote_confidence")
+        if conf is None:
+            buckets["missing"] += 1
+            # 没有 vote_confidence 字段（旧数据）→ 默认 medium 通过
+            if cutoff <= 2:
+                kept.append(s)
+            continue
+        buckets[conf] = buckets.get(conf, 0) + 1
+        if rank.get(conf, 0) >= cutoff:
+            kept.append(s)
+
+    print(f"  [Confidence] 分布 strong={buckets['strong']}  medium={buckets['medium']}  "
+          f"weak={buckets['weak']}  missing={buckets['missing']}")
+    print(f"  [Confidence] min_confidence={min_confidence}，保留 {len(kept)}/{len(samples)} 条")
+    return kept
 
 
 def save(samples: List[Dict], dataset: str, split: str,

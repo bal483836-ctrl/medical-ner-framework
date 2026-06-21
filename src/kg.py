@@ -369,9 +369,9 @@ def load_kg() -> KnowledgeGraph:
             print(f"  [KG] 降级失败: {e}")
 
     # v4.3: 合并训练集 gold 词表，防止 train 见过的实体被 KG 过滤误删。
-    # ⚠️ 这会让 train 的评估分数虚高（数据泄漏），评估真实泛化能力时设
-    # MNER_MERGE_TRAIN_VOCAB=false 关闭。
-    merge_train = os.environ.get("MNER_MERGE_TRAIN_VOCAB", "true").lower() != "false"
+    # ⚠️ 这会让 train 的评估分数虚高（数据泄漏）。**默认关闭**（v2 公平评估模式）。
+    # 真要打开 → MNER_MERGE_TRAIN_VOCAB=true。
+    merge_train = os.environ.get("MNER_MERGE_TRAIN_VOCAB", "false").lower() == "true"
     if merge_train:
         try:
             from src.data_processor import load_cmeee, build_cmeee_entity_vocab
